@@ -1,0 +1,77 @@
+Great Lakes Lighthouses — Seeed Studio XIAO ESP32C3
+=====================================================
+
+Power
+-----
+- XIAO ESP32C3: USB-C.
+- WS2812 / NeoPixel strip and the 8x32 matrix: 5 V sized for the LED count.
+  13 strip LEDs is easy from USB. A long strip plus the matrix needs its own
+  5 V supply.
+- Common GND between the XIAO, the strip, and the matrix is required.
+- SSD1306 OLED: 3.3 V and GND from the XIAO pins. Do not power it from a GPIO.
+- Data pins are 3.3 V. Do not connect a 5 V data line back into the XIAO.
+
+Pins (silk label on the board)
+------------------------------
+  Function              Pad    GPIO
+  Strip data            D8     8
+  LED matrix data       D3     5     8x32 WS2812, 5 V + common GND
+  OLED SDA              D4     6
+  OLED SCL              D5     7
+  Setup button          D1     3     momentary button to GND; hold ~3 s at boot
+  LDR 3.3 V             D6     21    held high; powers the light sensor only
+  LDR input             D2     4     analog input
+
+  Leave these alone:
+    D9 / GPIO 9 is a strap pin. Holding it low at reset puts the chip in
+    download mode.
+    GPIO 12–17 are the internal flash bus.
+    GPIO 18 and 19 are USB.
+
+  D8 / GPIO 8 is the strip data pin and is also a strap pin. The data line
+  should sit low while the board resets. Do not pull D8 high at power-up.
+
+  Light sensor: D6 (3.3 V, always on) -- LDR -- D2 -- 10k resistor -- GND.
+  D6 can only supply the sensor. The OLED still uses the board 3.3 V pin.
+  D0 and D7 are free.
+
+  OLED: copy ssd1306.py next to main.py. writer.py and sans18.py are optional;
+  without them the screen uses the built-in 8x8 font. sans20.py is the larger
+  second line when writer.py and sans18.py are also present.
+  LED matrix: copy led_matrix.py next to main.py. Snake-column wiring. If
+  letters look mirrored, change WIRING in led_matrix.py to COLUMN_MAJOR,
+  SNAKE_ROW, or ROW_MAJOR.
+
+  The strip, OLED, and matrix all run at once. Extra display "OLED and LED
+  matrix" is the default.
+
+LED order (south to north)
+-------------------------
+  0  Kewaunee Pierhead
+  1  Algoma Pierhead
+  2  Sturgeon Bay Ship Canal Light
+  3  Sturgeon Bay North Pierhead
+  4  Sherwood Point
+  5  Eagle Bluff
+  6  Chambers Island
+  7  Baileys Harbor Range Lights
+  8  Old Baileys Harbor (Birdcage)
+  9  Cana Island
+ 10  Plum Island Range Lights
+ 11  Pilot Island
+ 12  Pottawatomie (Rock Island)
+
+If your physical strip is longer, extra LEDs stay off. Set num_leds in setup
+to the number of WS2812 chips on the wire.
+
+Colors and flash (real characteristics)
+---------------------------------------
+  White  W   Canal-style lantern white
+  Red    R   navigation red (pierhead, canal, ranges)
+
+  Fl     flashing (short on, longer off)
+  Iso    isophase (equal on and off)
+  F      fixed (steady)
+  Fl(2)  group of two flashes in one period
+
+See README.md for each LED's official characteristic.

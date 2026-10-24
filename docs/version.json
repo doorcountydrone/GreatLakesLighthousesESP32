@@ -1,0 +1,54 @@
+{
+  "version": "0.6.51",
+  "board": "xiao-esp32c3",
+  "files": [
+    {
+      "name": "main.py",
+      "url": "https://raw.githubusercontent.com/doorcountydrone/GreatLakesLighthousesESP32/main/pico/main.py"
+    },
+    {
+      "name": "boot.py",
+      "url": "https://raw.githubusercontent.com/doorcountydrone/GreatLakesLighthousesESP32/main/pico/boot.py"
+    },
+    {
+      "name": "app.mpy",
+      "url": "https://raw.githubusercontent.com/doorcountydrone/GreatLakesLighthousesESP32/main/pico/app.mpy"
+    },
+    {
+      "name": "wifi_manager.mpy",
+      "url": "https://raw.githubusercontent.com/doorcountydrone/GreatLakesLighthousesESP32/main/pico/wifi_manager.mpy"
+    },
+    {
+      "name": "netreq.mpy",
+      "url": "https://raw.githubusercontent.com/doorcountydrone/GreatLakesLighthousesESP32/main/pico/netreq.mpy"
+    },
+    {
+      "name": "led_matrix.mpy",
+      "url": "https://raw.githubusercontent.com/doorcountydrone/GreatLakesLighthousesESP32/main/pico/led_matrix.mpy"
+    },
+    {
+      "name": "updater.mpy",
+      "url": "https://raw.githubusercontent.com/doorcountydrone/GreatLakesLighthousesESP32/main/pico/updater.mpy"
+    },
+    {
+      "name": "ssd1306.mpy",
+      "url": "https://raw.githubusercontent.com/doorcountydrone/GreatLakesLighthousesESP32/main/pico/ssd1306.mpy"
+    },
+    {
+      "name": "writer.mpy",
+      "url": "https://raw.githubusercontent.com/doorcountydrone/GreatLakesLighthousesESP32/main/pico/writer.mpy"
+    },
+    {
+      "name": "sans18.mpy",
+      "url": "https://raw.githubusercontent.com/doorcountydrone/GreatLakesLighthousesESP32/main/pico/sans18.mpy"
+    },
+    {
+      "name": "sans20.mpy",
+      "url": "https://raw.githubusercontent.com/doorcountydrone/GreatLakesLighthousesESP32/main/pico/sans20.mpy"
+    },
+    {
+      "name": "help.html",
+      "url": "https://raw.githubusercontent.com/doorcountydrone/GreatLakesLighthousesESP32/main/pico/help.html"
+    }
+  ]
+}

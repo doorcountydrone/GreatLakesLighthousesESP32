@@ -1,0 +1,126 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Help &amp; Instructions</title>
+  <style>
+    body { font-family: Arial, sans-serif; background: #0B1F3A; color: #F4EBD0; margin: 0; padding: 16px; line-height: 1.5; max-width: 600px; }
+    h1 { font-size: 1.35rem; color: #F4EBD0; }
+    h2 { font-size: 1.05rem; color: #F4EBD0; margin-top: 22px; }
+    a { color: #E8A838; }
+    .card { background: #16324F; padding: 15px; margin: 12px 0; border-radius: 8px; }
+    .card h3 { color: #E8A838; margin-top: 0; font-size: 1.05rem; }
+    p { margin: 8px 0; font-size: 0.95rem; }
+    strong { color: #F4EBD0; }
+  </style>
+</head>
+<body>
+  <p id="back"><a href="/" target="_parent">Back to setup</a></p>
+  <h1>Help &amp; Instructions</h1>
+
+  <div class="card">
+    <h3>Quick start</h3>
+    <p>1. On your phone, join the chart's setup Wi-Fi: name <strong>GreatLakes-Setup</strong>, password <strong>door1234</strong>.</p>
+    <p>2. Chart settings: enter your home (or hotel) Wi-Fi name and password — not the setup password — then tap <strong>Save &amp; Reboot</strong>. Wait for the chart to restart and join your network.</p>
+    <p>3. Lighthouses: the Door County lights are already there. Change the list if you want, then tap <strong>Save list</strong>.</p>
+    <p>Done. The lights blink like the real lighthouses. In Settings you can keep them flashing, or populate one by one (dark, then each light in order with the name on OLED or matrix).</p>
+  </div>
+
+  <div class="card">
+    <h3>What is this chart?</h3>
+    <p>Great Lakes Lighthouses is a nautical chart of lights. Each light matches a real lighthouse: white or red, steady or flashing, the same rhythm the lighthouse uses on the water.</p>
+    <p>You do not need to program anything. Use the Android app, or this page in a phone or computer browser. Both let you pick which lights are on the strip, and set Wi-Fi, brightness, and sleep.</p>
+  </div>
+
+  <h2>Getting started</h2>
+  <div class="card">
+    <h3>1. Connect to the chart's Wi-Fi</h3>
+    <p>The first time you plug the chart in, it makes its own Wi-Fi named <strong>GreatLakes-Setup</strong>. Password: <strong>door1234</strong>. Join that network on your phone. Turn off mobile data if your phone keeps leaving Wi-Fi.</p>
+    <p>Address: <strong>192.168.4.1</strong></p>
+    <h3>2. Give the chart your home Wi-Fi (Chart settings)</h3>
+    <p>Type your home or hotel Wi-Fi name and password. That is so the chart can reach the internet — not so your phone can join GreatLakes-Setup.</p>
+    <p>Tap <strong>Save &amp; Reboot</strong>. After it restarts, put your phone back on home Wi-Fi. The chart's address is now its home-network address, for example <strong>http://192.168.1.22</strong>. You can find that in your router's device list.</p>
+    <h3>3. Set your lights (Lighthouses)</h3>
+    <p>A finished Door County chart already has Kewaunee through Rock Island. <strong>Reload</strong> shows what is on the chart. <strong>Save list</strong> writes your list. List order is the order of the lights on the strip, south to north.</p>
+  </div>
+
+  <h2>Lighthouses tab</h2>
+  <div class="card">
+    <h3>Your light list</h3>
+    <p><strong>Reload</strong> loads the list that is already on the chart and replaces the list in the app. The app keeps the last list on the phone until you Reload or Save list.</p>
+    <p><strong>Save list</strong> sends your list to the chart. Do this after you add, skip, reorder, or remove lights. In the app, a warning appears if you leave Lights or Fetch again with unsaved changes.</p>
+    <p><strong>Use</strong> / skip: skip leaves that light dark but keeps its place on the strip.</p>
+    <p><strong>Tap an LED number</strong> (1 is the first on the strip) to light only that LED for a few seconds. This works on GreatLakes-Setup at 192.168.4.1, so you can check wiring when the chart cannot join a work or hotel network.</p>
+    <p><strong>Drag the handle</strong> (app) or <strong>Up / Down</strong> (browser) to move a light. First in the list is the first light on the strip (usually the southernmost).</p>
+    <p><strong>Add from catalog</strong> lets you pick Lighthouses, Lights, or Buoys, then a shore (Chicago, Wisconsin, Green Bay, Michigan, Huron, Huron ON, Georgian, Channel, Erie, Erie ON, America, Ontario ON, Straits, Superior, Superior ON) or search by name. Named towers are Lighthouses (Canal North Pierhead counts). Lights are numbered marks and marinas. Front/rear ranges and nearby green/red pairs are one catalog row — they share one LED. The line under the name says whether that LED is one color or green, then red. Color, flash, and nearest weather station are already filled in. Tap one to add it.</p>
+    <p><strong>Add custom</strong> is for a name, a flash pattern, and an optional nearby weather station (for example KSUE).</p>
+    <p><strong>Restore defaults</strong> puts back Kewaunee through Rock Island. Then tap Save list.</p>
+  </div>
+  <div class="card">
+    <h3>Finished chart vs building your own</h3>
+    <p>A finished Door County chart already has the lights set. You do not need to add or remove any.</p>
+    <p>Adding, skipping, or reordering is for a custom chart. Put lights in the same order as the strip on the board. No programming — just this page or the app.</p>
+  </div>
+
+  <h2>Chart settings tab</h2>
+  <div class="card">
+    <h3>Wi-Fi, brightness, and sleep</h3>
+    <p><strong>Home Wi-Fi</strong> name and password are for your router, not GreatLakes-Setup. Leave password blank to keep the one already saved.</p>
+    <p><strong>Light show</strong> is Keep flashing (every light stays on its real characteristic) or Populate one by one (goes dark, then lights each lighthouse in list order with the name on OLED or matrix). <strong>All lights flash</strong> is how many seconds they stay flashing as a set (10 to 1800; 180 is 3 minutes). <strong>Each light</strong> is how many seconds each lighthouse stays on during the tour (2 to 120). Save after you change this — no reboot needed.</p>
+    <p><strong>Extra display</strong> can be OLED and LED matrix together (the default), OLED only, matrix only, or strip only. The lighthouse strip is always on. On the XIAO ESP32C3 the strip is D8, the matrix is D3, and the OLED is D4 (SDA) and D5 (SCL). Save &amp; Reboot after you change this.</p>
+    <p><strong>LED matrix scroll</strong> is Weather only (default) or All lights. Weather only lists lights that currently have rain, fog, snow, lightning, or similar. If none do, it scrolls GREAT LAKES LIGHTHOUSES. <strong>Matrix scroll speed</strong> is 1 (slow) to 10 (fast). <strong>Scroll times</strong> is how many times each message crosses the OLED or matrix (1 to 10), then it waits until the text changes. Text enters from the right.</p>
+    <p><strong>Max brightness</strong> is how bright the lights get in a bright room (1 to 30). <strong>Min brightness</strong> is the dark-room floor (0 = off, 1–2 is a faint glow).</p>
+    <p>OLED (SSD1306): D4 data (SDA / GPIO 6), D5 clock (SCL / GPIO 7), and the board 3.3 V and GND pins. Copy ssd1306.py onto the chart. writer.py and sans18.py are optional larger fonts. The screen scrolls the same text as the matrix (IP once, then light names and weather). Matrix scroll speed also controls the OLED.</p>
+    <p>Light sensor: D6 is held at 3.3 V. Connect the LDR from D6 to D2, and a 10k resistor from D2 to GND. D6 powers only the sensor. Brightness moves between Min and Max as the room gets darker or brighter.</p>
+    <p>LED matrix (8x32 WS2812): data on D3 / GPIO 5, 5 V and common ground. Copy led_matrix.py onto the chart. Light names use flight-category color; weather codes use MetarMap colors (rain cyan, snow/fog white, lightning yellow, wind yellow, storms red).</p>
+    <p><strong>Refresh seconds</strong> is how often the chart checks online (30 to 3600). 300 is every 5 minutes.</p>
+    <p><strong>Beacon pulse on clear weather</strong> is a gentle brightness pulse when there is no rain, fog, snow, or similar.</p>
+    <p><strong>Sleep</strong> turns the lights off and on each night. Pick Central or Eastern; daylight saving switches by itself (second Sunday in March through first Sunday in November).</p>
+    <p><strong>Weekend / long off</strong> is an extra off stretch, for example Friday evening to Monday morning. It works together with nightly sleep.</p>
+    <p>On this page, <strong>Save &amp; Reboot</strong> saves settings and restarts the chart. That is normal.</p>
+    <p><strong>Install firmware update</strong> downloads a newer chart program from the internet and restarts. The chart must be on home Wi-Fi. Your light list and Wi-Fi stay. Until you tap Install, the chart keeps running as it is. This XIAO ESP32C3 build ignores a download that is not marked for this board.</p>
+  </div>
+
+  <h2>App updates</h2>
+  <div class="card">
+    <p>The Android app checks GitHub for a newer APK. Help and Settings show <strong>App update available</strong>. Tap it to download. That is not the same as chart firmware.</p>
+  </div>
+
+  <h2>Firmware updates</h2>
+  <div class="card">
+    <h3>When a newer version is ready</h3>
+    <p>After the chart joins home Wi-Fi, it checks online for a newer version. It does not install by itself.</p>
+    <p>If an update is waiting, Settings shows it, the browser page shows a yellow banner, and OLED / matrix scroll <strong>UPDATE AVAILABLE PRESS BUTTON</strong>. Press the setup button once to install, or tap Install firmware update. Hold the button 3 seconds to open GreatLakes-Setup.</p>
+    <p>The chart goes dark for a bit, then comes back. Wait about 30 seconds, then Fetch to confirm.</p>
+  </div>
+
+  <h2>Using the app</h2>
+  <div class="card">
+    <p>The Android app has four tabs along the bottom: Lights, Chart, Settings, and Help. On GreatLakes-Setup the Chart map may not load (no internet); tap an LED number on the Lights tab instead.</p>
+    <p>On GreatLakes-Setup or home Wi-Fi, tap <strong>Find chart</strong> in the app. It looks for /status on this Wi-Fi and fills in the Chart address. You can still type 192.168.4.1 (setup) or the chart's home-network address.</p>
+    <p>Lights tab: <strong>Fetch from chart</strong> and <strong>Save to chart</strong>. The app keeps the phone list when it opens — Fetch only if you want the strip’s list. Save sends the phone list to the chart. Settings tab: <strong>Fetch</strong>, <strong>Save</strong>, <strong>Save &amp; reboot</strong>, or <strong>Install firmware update</strong>.</p>
+  </div>
+
+  <h2>Troubleshooting</h2>
+  <div class="card">
+    <h3>App / phone / browser</h3>
+    <p><strong>Can't connect:</strong> join GreatLakes-Setup (password door1234) and use address 192.168.4.1. Turn off mobile data so the phone stays on that Wi-Fi.</p>
+    <p><strong>Fetch or Save failed:</strong> your phone must be on the same Wi-Fi as the chart. After setup, both must be on home Wi-Fi, and the address must be the chart's home-network address.</p>
+    <p>Type <strong>http://</strong> in front of the address if the page will not open.</p>
+    <p><strong>Phone hotspot:</strong> with hotel Wi-Fi off, Find chart and Fetch can work on this phone while the chart is on the hotspot. Weather can use IPv6 on some T-Mobile hotspots. If hotel Wi-Fi is also on, the app often cannot reach the chart.</p>
+  </div>
+  <div class="card">
+    <h3>The lights</h3>
+    <p>A light stays dark: check that it is set to Use, not skipped. Check sleep and weekend off times.</p>
+    <p>Sleep never turns the lights off: the chart needs home Wi-Fi so it can set the clock, and the time offset must match your local time.</p>
+    <p>Catalog search is empty: use Restore defaults or Add custom. On a finished chart the catalog is already there.</p>
+  </div>
+  <script>
+    if (location.protocol === 'file:') {
+      var back = document.getElementById('back');
+      if (back) back.style.display = 'none';
+    }
+  </script>
+</body>
+</html>

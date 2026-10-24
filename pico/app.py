@@ -1,0 +1,2386 @@
+import gc
+import json
+import math
+import os
+import machine
+import neopixel
+import network
+import socket
+import utime as time
+
+try:
+    # XIAO ESP32C3 tops out at 160 MHz. 250 MHz is the Pico 2 W clock.
+    machine.freq(160_000_000)
+except Exception as e:
+    print("cpu freq:", e)
+
+try:
+    import urequests
+except ImportError:
+    import requests as urequests
+
+try:
+    import netreq
+except ImportError:
+    netreq = None
+
+try:
+    import ntptime
+except ImportError:
+    ntptime = None
+
+# Fonts stay unloaded until an OLED answers. Compiling them at import
+# leaves too little RAM to compile wifi_manager on the ESP32-C3.
+fonts_available = False
+sans20_available = False
+sans18 = None
+writer = None
+sans20 = None
+
+FIRMWARE_VERSION = "0.6.51"
+CONFIG_FILE = "wifi_config.json"
+LIGHTHOUSE_FILE = "lighthouses.json"
+# Seeed XIAO ESP32C3 header. GPIO 9 is the boot strap (do not use).
+# GPIO 12–17 are the flash bus and GPIO 18–19 are USB. Never drive those.
+FORCE_AP_BUTTON_PIN = 3   # D1, button to GND
+FORCE_AP_FLAG = "force_ap.flag"
+LED_PIN = 8               # D8, lighthouse strip data
+NUM_LEDS = 13
+BRIGHTNESS = 0.18
+MIN_BRIGHTNESS = 0
+MAX_BRIGHTNESS = 18
+BEACON_PULSE = True
+CYCLE_DELAY = 300
+# LDR divider: D6 high (3.3 V) -- LDR -- D2 (ADC) -- 10k -- GND.
+# OLED stays on D4/D5 and the board 3.3 V pin. D2 is the only free ADC pad.
+LDR_ADC_PIN = 4           # D2, light-sensor input
+LDR_DRIVE_PIN = 21        # D6, held high as the sensor's 3.3 V
+OLED_SDA_PIN = 6          # D4
+OLED_SCL_PIN = 7          # D5
+# OLED power is the board 3V3 and GND pins.
+SAFE_GPIO = (3, 4, 5, 6, 7, 8, 10, 20, 21)
+# Yellow band is y=0–15. Title stays sans18 so "g" sits one row into blue at y=0.
+OLED_TITLE_Y = -1
+# Blue band is y=16–63. Second line uses sans20 when that file is on the Pico.
+OLED_BODY_Y = 32
+MATRIX_IDLE_MS = 15000
+TOUR_NORMAL_MS = 180000
+TOUR_DARK_MS = 2000
+TOUR_STEP_MS = 10000
+MATRIX_IDLE_COLOR = (40, 200, 210)
+MATRIX_SCROLL_SPEED = 7
+SCROLL_TIMES = 1
+BRIGHTNESS_CAP = 30
+DISPLAY_TYPE = "BOTH"
+MATRIX_SCROLL = "WEATHER"
+LIGHT_SHOW = "TOUR"
+
+# Navigation-light colors (not METAR categories).
+LIGHT_RGB = {
+    "W": (255, 255, 255),
+    "R": (255, 12, 0),
+    "G": (0, 220, 70),
+}
+CATEGORY_COLOR = {
+    "VFR": (0, 255, 0),
+    "MVFR": (0, 0, 255),
+    "IFR": (255, 0, 0),
+    "LIFR": (255, 0, 128),
+    "": (255, 255, 255),
+}
+
+# Same present-weather tokens as MarksMetarMap (exact METAR words).
+WX_TAGS = (
+    "BR", "-RA", "RA", "+RA", "-SN", "SN", "+SN", "SHSN", "LTG", "DSNT",
+    "WND", "FG", "FZFG", "FZFD", "CLR", "CC", "CA", "CG", "VCTS", "TS",
+    "-TSRA", "TSRA", "+TSRA",
+    "$", "FC", "+FC", "TORNADO",
+)
+WX_SKIP_SCROLL = ("CLR", "$")
+
+# Static ticker colors from MetarMap LED effects (rain cyan, snow/fog white, lightning yellow).
+WX_COLOR = {
+    "BR": (0, 255, 240),
+    "-RA": (0, 255, 139),
+    "RA": (0, 255, 139),
+    "+RA": (0, 255, 139),
+    "-SN": (255, 255, 255),
+    "SN": (255, 255, 255),
+    "+SN": (255, 255, 255),
+    "SHSN": (255, 255, 255),
+    "LTG": (255, 255, 0),
+    "DSNT": (255, 255, 0),
+    "WND": (255, 247, 0),
+    "FG": (255, 255, 255),
+    "FZFG": (255, 255, 255),
+    "FZFD": (0, 255, 180),
+    "CC": (255, 255, 255),
+    "CA": (255, 255, 255),
+    "CG": (255, 255, 255),
+    "VCTS": (255, 255, 255),
+    "TS": (255, 0, 0),
+    "-TSRA": (255, 0, 0),
+    "TSRA": (255, 0, 0),
+    "+TSRA": (255, 0, 0),
+    "FC": (255, 0, 0),
+    "+FC": (255, 0, 0),
+    "TORNADO": (255, 0, 0),
+}
+
+# Ticker words. Matching still uses the METAR token.
+WX_LABEL = {
+    "BR": "Mist",
+    "-RA": "Light Rain",
+    "RA": "Rain",
+    "+RA": "Heavy Rain",
+    "-SN": "Light Snow",
+    "SN": "Snow",
+    "+SN": "Heavy Snow",
+    "SHSN": "Snow Showers",
+    "LTG": "Lightning",
+    "DSNT": "Distant",
+    "WND": "Wind",
+    "FG": "Fog",
+    "FZFG": "Freezing Fog",
+    "FZFD": "Freezing",
+    "CC": "Cloud Lightning",
+    "CA": "Air Lightning",
+    "CG": "Ground Lightning",
+    "VCTS": "Thunder Nearby",
+    "TS": "Thunderstorm",
+    "-TSRA": "Light Thunderstorm Rain",
+    "TSRA": "Thunderstorm Rain",
+    "+TSRA": "Heavy Thunderstorm Rain",
+    "FC": "Funnel Cloud",
+    "+FC": "Tornado",
+    "TORNADO": "Tornado",
+}
+
+WX_FOG = ("FG", "BR", "FZFG", "HZ")
+WX_RAIN = ("-RA", "RA", "+RA", "-DZ", "DZ", "+DZ", "SHRA")
+WX_SNOW = ("-SN", "SN", "+SN", "SHSN", "-PE", "PE")
+WX_STORM = ("TS", "VCTS", "-TSRA", "TSRA", "+TSRA", "FC", "+FC", "TORNADO")
+WX_LTG = ("LTG", "DSNT", "CC", "CA", "CG")
+WX_WIND = ("WND",)
+
+lighthouses = []
+strip = None
+wlan = None
+http_sock = None
+http_sock_8080 = None
+_wifi_ssid = ""
+_wifi_password = ""
+_wifi_next_try = 0
+_wifi_connecting = False
+_wifi_connect_start = 0
+_wifi_fail_streak = 0
+_wifi_just_up = False
+_wifi_was_up = False
+WIFI_GIVE_MS = 10000
+WIFI_RETRY_MS = 12000
+status = {
+    "version": FIRMWARE_VERSION,
+    "ip": None,
+    "last_fetch": None,
+    "stations": {},
+}
+update_available = False
+update_info = None
+_ota_btn = None
+_ota_down_ms = None
+_ota_banner_done = False
+_ota_scroll_pending = False
+_identify_led = None
+_identify_until = 0
+_tour_phase = "normal"
+_tour_until = 0
+_tour_step = 0
+sleep_cfg = {
+    "sleep_enabled": False,
+    "sleep_at_hour": 22,
+    "sleep_at_minute": 0,
+    "wake_at_hour": 6,
+    "wake_at_minute": 0,
+    "timezone": "central",
+    "timezone_offset_hours": -6,
+    "weekend_mode_enabled": False,
+    "weekend_off_weekday": 4,
+    "weekend_off_hour": 18,
+    "weekend_off_minute": 0,
+    "weekend_on_weekday": 0,
+    "weekend_on_hour": 6,
+    "weekend_on_minute": 0,
+}
+clock_trusted = False
+ldr_adc = None
+_ldr_filt = None
+_ldr_out = None
+_ldr_raw = 0
+_ldr_last_ms = 0
+_ldr_print_ms = 0
+# D6 / GPIO 21 high -- LDR -- D2 / GPIO 4 -- 10k -- GND. Wide default so boot
+# uses the real ADC immediately; ends expand if a reading goes outside.
+LDR_ADC_LO = 500
+LDR_ADC_HI = 50000
+LDR_SAMPLE_MS = 400
+LDR_TAU_S = 0.4
+_adc_lo = LDR_ADC_LO
+_adc_hi = LDR_ADC_HI
+
+
+def _clamp(n, lo, hi):
+    return max(lo, min(hi, n))
+
+
+def _release_wifi_manager():
+    """Drop the setup page so the TLS buffer can be one contiguous block."""
+    import sys
+    mod = sys.modules.pop("wifi_manager", None)
+    if mod is not None:
+        del mod
+    gc.collect()
+
+
+def _import_wifi_manager(cfg):
+    """Compile wifi_manager while the heap is still empty of fonts and the matrix."""
+    gc.collect()
+    try:
+        import wifi_manager
+    except MemoryError:
+        gc.collect()
+        try:
+            import wifi_manager
+        except Exception as e:
+            print("wifi_manager:", e)
+            cfg["timezone"] = cfg.get("timezone") or "central"
+            return None
+    except Exception as e:
+        print("wifi_manager:", e)
+        cfg["timezone"] = cfg.get("timezone") or "central"
+        return None
+    try:
+        cfg["timezone"] = wifi_manager.timezone_id(cfg)
+        cfg["timezone_offset_hours"] = wifi_manager.timezone_offset_hours(cfg)
+    except Exception:
+        cfg["timezone"] = cfg.get("timezone") or "central"
+    return wifi_manager
+
+
+def _load_oled_fonts():
+    global fonts_available, sans20_available, sans18, writer, sans20
+    if fonts_available:
+        return True
+    gc.collect()
+    try:
+        import sans18 as font18
+        import writer as fontwriter
+        sans18 = font18
+        writer = fontwriter
+        fonts_available = True
+    except ImportError:
+        print("OLED fonts skipped (copy writer.py and sans18.py)")
+        return False
+    except MemoryError:
+        print("OLED fonts skipped (not enough RAM)")
+        return False
+    try:
+        import sans20 as font20
+        sans20 = font20
+        sans20_available = True
+    except ImportError:
+        sans20_available = False
+    except MemoryError:
+        sans20_available = False
+        print("sans20 skipped (not enough RAM)")
+    return True
+
+
+def _safe_gpio(n, default):
+    try:
+        n = int(n)
+    except Exception:
+        return default
+    if n in SAFE_GPIO:
+        return n
+    return default
+
+
+def _uses_oled():
+    return DISPLAY_TYPE in ("OLED", "BOTH")
+
+
+def _uses_matrix():
+    return DISPLAY_TYPE in ("LED_MATRIX", "BOTH")
+
+
+def load_config():
+    global LED_PIN, NUM_LEDS, BRIGHTNESS, MIN_BRIGHTNESS, MAX_BRIGHTNESS, BEACON_PULSE, CYCLE_DELAY, sleep_cfg, DISPLAY_TYPE, MATRIX_SCROLL, MATRIX_SCROLL_SPEED, SCROLL_TIMES, LIGHT_SHOW, TOUR_NORMAL_MS, TOUR_STEP_MS, _tour_phase, _tour_until, _tour_step, _ldr_filt, _ldr_out, _ldr_last_ms, _adc_lo, _adc_hi, _matrix_need_text, _matrix_hold_key, _oled_hold_key
+    old_min = MIN_BRIGHTNESS
+    old_max = MAX_BRIGHTNESS
+    try:
+        with open(CONFIG_FILE, "r") as f:
+            cfg = json.load(f)
+    except Exception:
+        cfg = {}
+    LED_PIN = _safe_gpio(cfg.get("led_pin", 8), 8)
+    NUM_LEDS = _clamp(int(cfg.get("num_leds", 13)), 1, 300)
+    kind = str(cfg.get("display_type", "BOTH")).strip().upper()
+    DISPLAY_TYPE = kind if kind in ("NONE", "OLED", "LED_MATRIX", "BOTH") else "BOTH"
+    scroll = str(cfg.get("matrix_scroll", "WEATHER")).strip().upper()
+    MATRIX_SCROLL = scroll if scroll in ("WEATHER", "ALL") else "WEATHER"
+    try:
+        MATRIX_SCROLL_SPEED = _clamp(int(cfg.get("matrix_scroll_speed", 7)), 1, 10)
+    except Exception:
+        MATRIX_SCROLL_SPEED = 7
+    try:
+        new_times = _clamp(int(cfg.get("scroll_times", 1)), 1, 10)
+    except Exception:
+        new_times = 1
+    if new_times != SCROLL_TIMES:
+        _matrix_need_text = True
+        _matrix_hold_key = ""
+        _oled_hold_key = ""
+    SCROLL_TIMES = new_times
+    old_show = LIGHT_SHOW
+    old_flash = TOUR_NORMAL_MS
+    old_step = TOUR_STEP_MS
+    show = str(cfg.get("light_show", "TOUR")).strip().upper()
+    LIGHT_SHOW = show if show in ("FLASH", "TOUR") else "TOUR"
+    try:
+        TOUR_NORMAL_MS = _clamp(int(cfg.get("tour_flash_s", 180)), 10, 1800) * 1000
+    except Exception:
+        TOUR_NORMAL_MS = 180000
+    try:
+        TOUR_STEP_MS = _clamp(int(cfg.get("tour_step_s", 10)), 2, 120) * 1000
+    except Exception:
+        TOUR_STEP_MS = 10000
+    if LIGHT_SHOW != "TOUR":
+        _tour_phase = "normal"
+        _tour_step = 0
+        _tour_until = 0
+    elif (
+        old_show != LIGHT_SHOW
+        or old_flash != TOUR_NORMAL_MS
+        or old_step != TOUR_STEP_MS
+    ):
+        now = time.ticks_ms()
+        if _tour_phase == "populate":
+            _tour_until = time.ticks_add(now, TOUR_STEP_MS)
+        elif _tour_phase == "dark":
+            _tour_until = time.ticks_add(now, TOUR_DARK_MS)
+        else:
+            _tour_phase = "normal"
+            _tour_step = 0
+            _tour_until = time.ticks_add(now, TOUR_NORMAL_MS)
+        _tour_refresh_screens()
+    BRIGHTNESS = max(0.02, min(1.0, float(cfg.get("brightness", 0.18))))
+    if "max_brightness" in cfg:
+        MAX_BRIGHTNESS = _clamp(int(cfg.get("max_brightness", 18)), 1, BRIGHTNESS_CAP)
+    else:
+        MAX_BRIGHTNESS = _clamp(int(round(BRIGHTNESS * 255)), 1, BRIGHTNESS_CAP)
+    MIN_BRIGHTNESS = _clamp(int(cfg.get("min_brightness", 0)), 0, BRIGHTNESS_CAP)
+    if MIN_BRIGHTNESS > MAX_BRIGHTNESS:
+        MIN_BRIGHTNESS = MAX_BRIGHTNESS
+    BRIGHTNESS = max(0.02, min(1.0, MAX_BRIGHTNESS / 255.0))
+    BEACON_PULSE = bool(cfg.get("beacon_pulse", True))
+    CYCLE_DELAY = _clamp(int(cfg.get("cycle_delay", 300)), 30, 3600)
+    for k in sleep_cfg:
+        if k in cfg:
+            sleep_cfg[k] = cfg[k]
+    print("Display", DISPLAY_TYPE, "show", LIGHT_SHOW, "flash", TOUR_NORMAL_MS, "step", TOUR_STEP_MS, "scroll", MATRIX_SCROLL, "speed", MATRIX_SCROLL_SPEED, "times", SCROLL_TIMES, "bright", MIN_BRIGHTNESS, "-", MAX_BRIGHTNESS)
+    if old_min != MIN_BRIGHTNESS or old_max != MAX_BRIGHTNESS:
+        _ldr_filt = None
+        _ldr_out = None
+        _ldr_last_ms = 0
+        _adc_lo = LDR_ADC_LO
+        _adc_hi = LDR_ADC_HI
+    _remember_wifi(cfg)
+    return cfg
+
+
+def force_ap_held():
+    pin = machine.Pin(FORCE_AP_BUTTON_PIN, machine.Pin.IN, machine.Pin.PULL_UP)
+    if pin.value() == 0:
+        print("AP button down at startup")
+        return True
+    return False
+
+
+def consume_force_ap_flag():
+    try:
+        if FORCE_AP_FLAG in os.listdir():
+            os.remove(FORCE_AP_FLAG)
+            print("Setup button held — opening AP")
+            return True
+    except Exception as e:
+        print("force AP flag:", e)
+    return False
+
+
+def request_force_ap_reboot():
+    try:
+        with open(FORCE_AP_FLAG, "w") as f:
+            f.write("1")
+    except Exception as e:
+        print("force AP flag write:", e)
+    machine.reset()
+
+
+def _remember_wifi(cfg):
+    global _wifi_ssid, _wifi_password
+    ssid = cfg.get("ssid")
+    if ssid:
+        _wifi_ssid = ssid
+        pw = cfg.get("password")
+        if pw:
+            _wifi_password = pw
+        elif pw == "":
+            _wifi_password = ""
+
+
+def connect_wifi(cfg):
+    global wlan, _wifi_was_up
+    _remember_wifi(cfg)
+    ssid = cfg.get("ssid")
+    password = cfg.get("password")
+    if not ssid:
+        return False
+    # Leftover AP from setup mode or a previous Thonny run blocks STA (CYW43 EPERM).
+    try:
+        ap = network.WLAN(network.AP_IF)
+        if ap.active():
+            ap.active(False)
+            time.sleep_ms(500)
+    except Exception:
+        pass
+    wlan = network.WLAN(network.STA_IF)
+    for attempt in range(3):
+        try:
+            try:
+                wlan.active(False)
+            except Exception:
+                pass
+            time.sleep_ms(300)
+            wlan.active(True)
+            time.sleep(1)
+            if not wlan.isconnected():
+                wlan.connect(ssid, password or "")
+                for _ in range(20):
+                    if wlan.isconnected():
+                        break
+                    time.sleep(1)
+            if wlan.isconnected():
+                _wifi_stay_awake(wlan)
+                try:
+                    wlan.ipconfig(dhcp6=True)
+                except Exception:
+                    pass
+                status["ip"] = wlan.ifconfig()[0]
+                print("WiFi", status["ip"])
+                try:
+                    print("IPv6", wlan.ipconfig("addr6"))
+                except Exception:
+                    pass
+                _wifi_was_up = True
+                return True
+        except OSError as e:
+            print("WiFi retry", attempt + 1, e)
+            time.sleep_ms(500)
+    return False
+
+
+def _wifi_stay_awake(iface):
+    """ESP32 modem sleep drops the STA link while the strip is animating."""
+    try:
+        iface.config(pm=iface.PM_NONE)
+    except Exception:
+        pass
+
+
+def _wifi_apply_up(recovered):
+    global _wifi_connecting, _wifi_fail_streak, _wifi_just_up, _wifi_was_up, _wifi_next_try
+    _wifi_connecting = False
+    _wifi_fail_streak = 0
+    _wifi_next_try = 0
+    _wifi_was_up = True
+    _wifi_stay_awake(wlan)
+    try:
+        wlan.ipconfig(dhcp6=True)
+    except Exception:
+        pass
+    try:
+        ip = wlan.ifconfig()[0]
+    except Exception:
+        ip = None
+    old = status.get("ip")
+    status["ip"] = ip
+    if ip and ip != old:
+        print("WiFi", ip)
+        try:
+            print("IPv6", wlan.ipconfig("addr6"))
+        except Exception:
+            pass
+        restart_http()
+    if recovered:
+        _wifi_just_up = True
+
+
+def _wifi_begin_connect():
+    global wlan, _wifi_connecting, _wifi_connect_start, _wifi_fail_streak, _wifi_next_try
+    if not _wifi_ssid:
+        return
+    if wlan is None:
+        wlan = network.WLAN(network.STA_IF)
+    try:
+        if _wifi_fail_streak and _wifi_fail_streak % 3 == 0:
+            try:
+                wlan.active(False)
+            except Exception:
+                pass
+            time.sleep_ms(250)
+        if not wlan.active():
+            wlan.active(True)
+            time.sleep_ms(200)
+        _wifi_stay_awake(wlan)
+        try:
+            wlan.disconnect()
+        except Exception:
+            pass
+        time.sleep_ms(50)
+        wlan.connect(_wifi_ssid, _wifi_password or "")
+        _wifi_connecting = True
+        _wifi_connect_start = time.ticks_ms()
+        print("WiFi reconnecting...")
+    except OSError as e:
+        print("WiFi reconnect", e)
+        _wifi_fail_streak += 1
+        _wifi_connecting = False
+        _wifi_next_try = time.ticks_add(time.ticks_ms(), WIFI_RETRY_MS)
+
+
+def wifi_keep():
+    global _wifi_connecting, _wifi_fail_streak, _wifi_next_try, _wifi_was_up
+    if not _wifi_ssid or wlan is None:
+        return
+    now = time.ticks_ms()
+    try:
+        up = wlan.isconnected()
+    except Exception:
+        up = False
+    if up:
+        recovered = (not _wifi_was_up) or (not status.get("ip"))
+        if recovered or _wifi_connecting:
+            _wifi_apply_up(recovered)
+        else:
+            try:
+                ip = wlan.ifconfig()[0]
+            except Exception:
+                ip = None
+            if ip and ip != status.get("ip"):
+                _wifi_apply_up(False)
+        return
+    if status.get("ip") or _wifi_was_up:
+        print("WiFi lost — retrying")
+        status["ip"] = None
+        _wifi_was_up = False
+        _wifi_connecting = False
+        _wifi_next_try = 0
+    if _wifi_connecting:
+        if time.ticks_diff(now, _wifi_connect_start) < WIFI_GIVE_MS:
+            return
+        _wifi_connecting = False
+        _wifi_fail_streak += 1
+        _wifi_next_try = time.ticks_add(now, WIFI_RETRY_MS)
+        print("WiFi retry later")
+        return
+    if _wifi_next_try and time.ticks_diff(_wifi_next_try, now) > 0:
+        return
+    _wifi_begin_connect()
+
+
+def load_lighthouses():
+    global lighthouses
+    try:
+        items = []
+        for name in ("lighthouses.json", "lighthouses_defaults.json"):
+            try:
+                with open(name, "r") as f:
+                    raw = f.read()
+            except Exception:
+                continue
+            if raw.startswith("\ufeff"):
+                raw = raw[1:]
+            if not raw.strip():
+                continue
+            data = json.loads(raw)
+            items = data.get("lighthouses", []) if isinstance(data, dict) else data
+            if isinstance(items, list) and items:
+                break
+        if not items:
+            raise ValueError("empty list")
+        items.sort(key=lambda x: int(x.get("led", 0)))
+        lighthouses = items
+        print("Loaded", len(lighthouses), "lighthouses")
+    except Exception as e:
+        print("lighthouses.json failed:", e)
+        print("Re-copy pico/lighthouses.json to the board as UTF-8 text.")
+        lighthouses = []
+
+
+def init_strip():
+    global strip
+    strip = neopixel.NeoPixel(machine.Pin(LED_PIN), NUM_LEDS)
+    for i in range(NUM_LEDS):
+        strip[i] = (0, 0, 0)
+    strip.write()
+    print("Strip GPIO", LED_PIN, "x", NUM_LEDS)
+
+
+def _ldr_level_from_t(t):
+    if t is None:
+        t = 1.0
+    level = t * (MAX_BRIGHTNESS - MIN_BRIGHTNESS) + MIN_BRIGHTNESS
+    return _clamp(int(level + 0.5), MIN_BRIGHTNESS, MAX_BRIGHTNESS)
+
+
+def _pwm_from_slider(level):
+    """0 = off. 1-8 stay very dim (raw WS2812 counts). 30 = full."""
+    if level <= 0:
+        return 0
+    if level <= 8:
+        return int(level)
+    return _clamp(int(8 + (level - 8) * (255 - 8) / (BRIGHTNESS_CAP - 8)), 0, 255)
+
+
+def _ldr_refresh():
+    """Map this board's live dark..bright ADC onto min..max so min=2 is actually 2 when covered."""
+    global _ldr_filt, _ldr_out, _ldr_raw, _ldr_last_ms, _ldr_print_ms, _adc_lo, _adc_hi
+    if ldr_adc is None:
+        _ldr_out = float(MAX_BRIGHTNESS)
+        return int(_ldr_out)
+    now = time.ticks_ms()
+    if _ldr_last_ms and _ldr_filt is not None and time.ticks_diff(now, _ldr_last_ms) < LDR_SAMPLE_MS:
+        out = _ldr_level_from_t(_ldr_filt)
+        _ldr_out = float(out)
+        return out
+    _ldr_last_ms = now
+    try:
+        acc = 0
+        for _ in range(4):
+            acc += ldr_adc.read_u16()
+        raw = acc >> 2
+    except Exception:
+        _ldr_out = float(MAX_BRIGHTNESS)
+        return int(_ldr_out)
+    _ldr_raw = raw
+    if raw < _adc_lo:
+        _adc_lo = raw
+    if raw > _adc_hi:
+        _adc_hi = raw
+    span = float(_adc_hi - _adc_lo)
+    if span < 1:
+        span = 1
+    t = (raw - _adc_lo) / span
+    if t < 0.0:
+        t = 0.0
+    elif t > 1.0:
+        t = 1.0
+    _ldr_filt = t
+    out = _ldr_level_from_t(_ldr_filt)
+    _ldr_out = float(out)
+    if time.ticks_diff(now, _ldr_print_ms) > 2500:
+        _ldr_print_ms = now
+        print("LDR", raw, "lo", int(_adc_lo), "hi", int(_adc_hi), "->", out, "min", MIN_BRIGHTNESS, "max", MAX_BRIGHTNESS)
+    return out
+
+
+def _ldr_level():
+    return _ldr_refresh()
+
+
+def scale_color(rgb, brightness=None):
+    r, g, b = rgb
+    peak = max(r, g, b)
+    if peak <= 0:
+        return (0, 0, 0)
+    if brightness is not None:
+        pwm = _clamp(int(round(float(brightness) * 255)), 0, 255)
+    else:
+        pwm = _pwm_from_slider(_ldr_level())
+    return (
+        _clamp(r * pwm // peak, 0, 255),
+        _clamp(g * pwm // peak, 0, 255),
+        _clamp(b * pwm // peak, 0, 255),
+    )
+
+
+def paint_all(rgb):
+    c = scale_color(rgb)
+    for i in range(NUM_LEDS):
+        strip[i] = c
+    strip.write()
+
+
+def startup_chase():
+    count = min(NUM_LEDS, max(1, len(lighthouses)))
+    for i in range(count):
+        for j in range(NUM_LEDS):
+            strip[j] = (0, 0, 0)
+        lh = lighthouses[i] if i < len(lighthouses) else None
+        color = light_color(lh) if lh else (255, 180, 60)
+        strip[i] = scale_color(color, 0.28)
+        strip.write()
+        time.sleep_ms(160)
+    paint_all((0, 0, 0))
+
+
+def _metar_id(sid):
+    """AWC wants K + 3-char FAA ids (3D2 -> K3D2, 2P2 -> K2P2)."""
+    sid = str(sid or "").strip().upper()
+    if not sid:
+        return ""
+    if len(sid) == 3:
+        return "K" + sid
+    return sid
+
+
+def unique_stations():
+    ids = []
+    for lh in lighthouses:
+        sid = _metar_id(lh.get("metar", ""))
+        fb = _metar_id(lh.get("metar_fallback", "KSUE"))
+        if sid and sid not in ids:
+            ids.append(sid)
+        if fb and fb not in ids:
+            ids.append(fb)
+    return ids
+
+
+def _parse_flight_category(raw_text):
+    if not raw_text:
+        return ""
+    raw = raw_text.strip().upper()
+    vis_m = 10.0
+    ceiling_ft = 10000
+    i = raw.find("SM")
+    if i > 0:
+        start = i
+        while start > 0 and (raw[start - 1].isdigit() or raw[start - 1] in "/.M "):
+            start -= 1
+        tok = raw[start:i].strip()
+        if tok.startswith("P") or tok.startswith("M"):
+            tok = tok[1:]
+        try:
+            if "/" in tok:
+                if " " in tok:
+                    parts = tok.split()
+                    whole = int(parts[0]) if parts[0].isdigit() else 0
+                    a, b = parts[1].split("/", 1)
+                    vis_m = whole + int(a) / max(1, int(b))
+                else:
+                    a, b = tok.split("/", 1)
+                    vis_m = int(a) / max(1, int(b))
+            else:
+                vis_m = float(tok)
+        except Exception:
+            pass
+    for prefix in ("BKN", "OVC", "VV"):
+        idx = 0
+        while True:
+            idx = raw.find(prefix, idx)
+            if idx < 0:
+                break
+            idx += len(prefix)
+            if idx + 3 <= len(raw) and raw[idx:idx + 3].isdigit():
+                h = int(raw[idx:idx + 3]) * 100
+                if h < ceiling_ft:
+                    ceiling_ft = h
+            idx += 1
+    if ceiling_ft < 500 or vis_m < 1.0:
+        return "LIFR"
+    if ceiling_ft < 1000 or vis_m < 3.0:
+        return "IFR"
+    if ceiling_ft < 3000 or vis_m < 5.0:
+        return "MVFR"
+    return "VFR"
+
+
+def _metar_body(raw_text):
+    """Present-weather side of a METAR only. RMK is history / lightning notes."""
+    raw = str(raw_text or "").strip().upper()
+    if not raw:
+        return ""
+    i = raw.find(" RMK")
+    if i < 0:
+        i = raw.find(" RMK ")
+    if i >= 0:
+        raw = raw[:i]
+    return raw
+
+
+def wx_codes(raw_text):
+    """Present-weather WX_TAGS only (before RMK), for the matrix/OLED ticker."""
+    if not raw_text:
+        return []
+    toks = _metar_body(raw_text).split()
+    out = []
+    for tag in WX_TAGS:
+        if tag in WX_SKIP_SCROLL:
+            continue
+        if tag in toks:
+            out.append(tag)
+    return out
+
+
+def wx_bits(raw_text):
+    bits = 0
+    if not raw_text:
+        return 0
+    for tok in _metar_body(raw_text).split():
+        if tok in WX_FOG:
+            bits |= 1
+        elif tok in WX_RAIN:
+            bits |= 2
+        elif tok in WX_SNOW:
+            bits |= 4
+        elif tok in WX_STORM or tok in WX_LTG:
+            bits |= 8
+        elif tok in WX_WIND:
+            bits |= 16
+    return bits
+
+
+def _http_get_text(url, timeout=12):
+    if netreq is not None:
+        return netreq.get_text(url, timeout)
+    gc.collect()
+    resp = None
+    try:
+        resp = urequests.get(url, timeout=timeout)
+        return resp.text or ""
+    finally:
+        if resp is not None:
+            try:
+                resp.close()
+            except Exception:
+                pass
+        gc.collect()
+
+
+def _station_from_line(line, wanted):
+    line = line.strip()
+    if not line:
+        return None, None
+    parts = line.split()
+    if not parts:
+        return None, None
+    first = parts[0].upper()
+    if first in ("METAR", "SPECI"):
+        station = parts[1].upper() if len(parts) > 1 else ""
+    else:
+        station = first
+    if station in wanted:
+        return station, line
+    return None, None
+
+
+def _metar_obs_minutes(line):
+    """ddhhmmZ from a METAR line, as minutes, for newest-wins."""
+    for tok in str(line).upper().split():
+        if len(tok) == 7 and tok.endswith("Z") and tok[:6].isdigit():
+            return int(tok[0:2]) * 1440 + int(tok[2:4]) * 60 + int(tok[4:6])
+    return -1
+
+
+def _metar_is_newer(new_line, old_line):
+    n = _metar_obs_minutes(new_line)
+    o = _metar_obs_minutes(old_line)
+    if n < 0:
+        return False
+    if o < 0:
+        return True
+    # Month wrap: day 1 after day 28–31.
+    if o - n > 20000:
+        return True
+    if n - o > 20000:
+        return False
+    return n > o
+
+
+def _store_metar(found, station, raw, category=""):
+    prev = found.get(station)
+    if prev and not _metar_is_newer(raw, prev.get("raw") or ""):
+        return
+    found[station] = {
+        "category": category or _parse_flight_category(raw) or "VFR",
+        "raw": raw,
+        "wx": wx_bits(raw),
+    }
+
+
+def _metar_records(text):
+    """One complete METAR/SPECI per item, even if AWC glued several on one line."""
+    text = str(text or "").replace("\r", "\n")
+    records = []
+    for chunk in text.split("\n"):
+        chunk = chunk.strip()
+        if not chunk:
+            continue
+        start = 0
+        up = chunk.upper()
+        while start < len(chunk):
+            rest = up[start + 1:]
+            nxt_m = rest.find(" METAR ")
+            nxt_s = rest.find(" SPECI ")
+            nxt = -1
+            if nxt_m >= 0 and nxt_s >= 0:
+                nxt = min(nxt_m, nxt_s)
+            elif nxt_m >= 0:
+                nxt = nxt_m
+            elif nxt_s >= 0:
+                nxt = nxt_s
+            if nxt < 0:
+                piece = chunk[start:].strip()
+                if piece:
+                    records.append(piece)
+                break
+            end = start + 1 + nxt
+            piece = chunk[start:end].strip()
+            if piece:
+                records.append(piece)
+            start = end + 1
+    return records
+
+
+def _ingest_raw(text, wanted, found):
+    for line in _metar_records(text):
+        station, raw = _station_from_line(line, wanted)
+        if station:
+            _store_metar(found, station, raw)
+
+
+def _ingest_xml(text, station, found):
+    idx = 0
+    while True:
+        rt_start = text.find("<raw_text>", idx)
+        rt_end = text.find("</raw_text>", rt_start)
+        if rt_start < 0 or rt_end < 0:
+            return
+        raw = text[rt_start + 10:rt_end].strip()
+        idx = rt_end + 1
+        if not raw:
+            continue
+        next_rt = text.find("<raw_text>", rt_end)
+        search_end = next_rt if next_rt >= 0 else len(text)
+        fc_start = text.find("<flight_category>", rt_end)
+        fc_end = text.find("</flight_category>", fc_start)
+        category = ""
+        if fc_start >= 0 and fc_end > fc_start and fc_start < search_end:
+            category = text[fc_start + 17:fc_end].strip().upper()
+        _store_metar(found, station, raw, category)
+
+
+def fetch_metars():
+    global _matrix_need_text, _oled_msgs
+    _release_wifi_manager()
+    ids = unique_stations()
+    if not ids:
+        return
+    wanted = {}
+    for sid in ids:
+        wanted[sid] = True
+    found = {}
+    # No hours = current observation only (hours=1 returns every report in the last hour).
+    url = "https://aviationweather.gov/api/data/metar?ids=%s&format=raw" % ",".join(ids)
+    print("Fetch", url)
+    bulk_err = ""
+    try:
+        _ingest_raw(_http_get_text(url), wanted, found)
+    except Exception as e:
+        bulk_err = str(e)
+        print("METAR bulk failed:", e)
+        if "ENOMEM" in bulk_err:
+            _release_wifi_manager()
+            time.sleep_ms(400)
+            try:
+                _ingest_raw(_http_get_text(url), wanted, found)
+                bulk_err = ""
+            except Exception as e2:
+                bulk_err = str(e2)
+                print("METAR bulk retry failed:", e2)
+    missing = [sid for sid in ids if sid not in found]
+    if missing and not found and "ENOMEM" in bulk_err:
+        print("METAR skipped, low memory")
+        missing = []
+    for sid in missing:
+        try:
+            one = "https://aviationweather.gov/api/data/metar?ids=%s&format=raw" % sid
+            print("Fetch", sid)
+            _ingest_raw(_http_get_text(one, timeout=10), wanted, found)
+        except Exception as e:
+            print("METAR", sid, "raw failed:", e)
+        if sid in found:
+            continue
+        try:
+            xml_url = "https://aviationweather.gov/api/data/metar?ids=%s&format=xml" % sid
+            _ingest_xml(_http_get_text(xml_url, timeout=10), sid, found)
+            if sid in found:
+                print("Got", sid, "from XML")
+        except Exception as e:
+            print("METAR", sid, "xml failed:", e)
+    status["stations"] = found
+    status["last_fetch"] = time.time()
+    if not _ota_scroll_pending:
+        _matrix_need_text = True
+        _oled_msgs = []
+    still = [sid for sid in ids if sid not in found]
+    print("Got", len(found), "stations", list(found.keys()))
+    for sid in found:
+        raw = found[sid].get("raw", "")
+        codes = wx_codes(raw)
+        print(sid, raw[:72])
+        print(" ", "wx", " ".join(WX_LABEL.get(c, c) for c in codes) if codes else "none")
+    if still:
+        print("No METAR yet:", still)
+
+
+def station_for(lh):
+    stations = status.get("stations") or {}
+    primary = _metar_id(lh.get("metar", ""))
+    fallback = _metar_id(lh.get("metar_fallback", "KSUE"))
+    if primary in stations:
+        return stations[primary]
+    raw = str(lh.get("metar", "")).strip().upper()
+    if raw in stations:
+        return stations[raw]
+    if fallback in stations:
+        return stations[fallback]
+    return None
+
+
+def local_parts():
+    """Local weekday (0=Mon), hour, minute using Central/Eastern and US DST."""
+    import sys
+    mod = sys.modules.get("wifi_manager")
+    if mod is not None:
+        off = int(mod.timezone_offset_hours(sleep_cfg))
+    else:
+        try:
+            off = int(sleep_cfg.get("timezone_offset_hours", -6))
+        except Exception:
+            off = -6
+    t = time.gmtime(time.time() + off * 3600)
+    return t[6], t[3], t[4]
+
+
+def _in_daily_sleep(hour, minute):
+    if not sleep_cfg.get("sleep_enabled"):
+        return False
+    sh = int(sleep_cfg.get("sleep_at_hour", 22))
+    sm = int(sleep_cfg.get("sleep_at_minute", 0))
+    wh = int(sleep_cfg.get("wake_at_hour", 6))
+    wm = int(sleep_cfg.get("wake_at_minute", 0))
+    now = hour * 60 + minute
+    sleep_at = sh * 60 + sm
+    wake_at = wh * 60 + wm
+    if sleep_at == wake_at:
+        return False
+    if sleep_at < wake_at:
+        return sleep_at <= now < wake_at
+    return now >= sleep_at or now < wake_at
+
+
+def _week_minutes(wd, hour, minute):
+    return int(wd) * 1440 + int(hour) * 60 + int(minute)
+
+
+def _in_weekend(weekday, hour, minute):
+    if not sleep_cfg.get("weekend_mode_enabled"):
+        return False
+    start = _week_minutes(
+        sleep_cfg.get("weekend_off_weekday", 4),
+        sleep_cfg.get("weekend_off_hour", 18),
+        sleep_cfg.get("weekend_off_minute", 0),
+    )
+    end = _week_minutes(
+        sleep_cfg.get("weekend_on_weekday", 0),
+        sleep_cfg.get("weekend_on_hour", 6),
+        sleep_cfg.get("weekend_on_minute", 0),
+    )
+    cur = _week_minutes(weekday, hour, minute)
+    if start < end:
+        return start <= cur < end
+    if start > end:
+        return cur >= start or cur < end
+    return False
+
+
+def in_sleep_window():
+    if not clock_trusted:
+        return False
+    wd, h, m = local_parts()
+    return _in_weekend(wd, h, m) or _in_daily_sleep(h, m)
+
+
+def sync_ntp():
+    global clock_trusted
+    if ntptime is not None:
+        try:
+            ntptime.settime()
+            clock_trusted = True
+            print("NTP ok")
+            return
+        except Exception as e:
+            print("NTP IPv4 failed:", e)
+    if netreq is None:
+        return
+    try:
+        netreq.apply_ntp(netreq.ntp())
+        clock_trusted = True
+        print("NTP ok (IPv6)")
+    except Exception as e:
+        print("NTP failed:", e)
+
+
+def light_specs(lh):
+    out = []
+    for key in ("light", "light_b"):
+        spec = lh.get(key)
+        if isinstance(spec, dict):
+            out.append(spec)
+    extra = lh.get("lights")
+    if isinstance(extra, list) and not out:
+        out = [s for s in extra if isinstance(s, dict)]
+    return out
+
+
+def light_spec(lh):
+    specs = light_specs(lh)
+    return specs[0] if specs else {}
+
+
+def light_color(lh):
+    code = str(light_spec(lh).get("color", "W")).upper()
+    return LIGHT_RGB.get(code, LIGHT_RGB["W"])
+
+
+def spec_period_s(spec):
+    if not spec:
+        return 1.0
+    on_s = spec.get("on_s") or [1.0]
+    off_s = spec.get("off_s") or [0.0]
+    period_s = float(spec.get("period_s") or 0)
+    if period_s <= 0:
+        n = max(len(on_s), len(off_s))
+        for i in range(n):
+            period_s += float(on_s[i] if i < len(on_s) else 0)
+            period_s += float(off_s[i] if i < len(off_s) else 0)
+    if period_s <= 0:
+        period_s = 1.0
+    return period_s
+
+
+def spec_on(spec, now_ms):
+    """True when this aid would be lit, using on_s/off_s pairs that fill period_s."""
+    if not spec:
+        return True
+    on_s = spec.get("on_s") or [1.0]
+    off_s = spec.get("off_s") or [0.0]
+    period_s = spec_period_s(spec)
+    # Fixed light: no eclipse
+    if len(off_s) == 1 and float(off_s[0]) <= 0 and len(on_s) == 1:
+        return True
+    t = (now_ms % int(period_s * 1000)) / 1000.0
+    cursor = 0.0
+    n = max(len(on_s), len(off_s))
+    for i in range(n):
+        on = float(on_s[i] if i < len(on_s) else 0)
+        if t < cursor + on:
+            return on > 0
+        cursor += on
+        off = float(off_s[i] if i < len(off_s) else 0)
+        if t < cursor + off:
+            return False
+        cursor += off
+    return False
+
+
+def characteristic_on(lh, now_ms):
+    return frame_color(lh, now_ms) is not None
+
+
+def frame_color(lh, now_ms):
+    specs = light_specs(lh)
+    if not specs:
+        return LIGHT_RGB["W"]
+    if len(specs) == 1:
+        spec = specs[0]
+        if spec_on(spec, now_ms):
+            code = str(spec.get("color", "W")).upper()
+            return LIGHT_RGB.get(code, LIGHT_RGB["W"])
+        return None
+    slices = []
+    for spec in specs:
+        ms = int(spec_period_s(spec) * 1000)
+        if ms < 200:
+            ms = 200
+        slices.append((spec, ms))
+    total = 0
+    for _spec, ms in slices:
+        total += ms
+    t = now_ms % total
+    acc = 0
+    for spec, ms in slices:
+        if t < acc + ms:
+            if spec_on(spec, t - acc):
+                code = str(spec.get("color", "W")).upper()
+                return LIGHT_RGB.get(code, LIGHT_RGB["W"])
+            return None
+        acc += ms
+    return None
+
+
+def start_identify(led_i, ms=8000):
+    global _identify_led, _identify_until
+    led_i = int(led_i)
+    hold = _clamp(int(ms), 500, 4000)
+    _identify_led = led_i
+    _identify_until = time.ticks_add(time.ticks_ms(), hold)
+    paint_identify(led_i)
+    return hold
+
+
+def clear_identify():
+    global _identify_led, _identify_until
+    _identify_led = None
+    _identify_until = 0
+
+
+def paint_identify(led_i):
+    if strip is None:
+        return
+    for i in range(NUM_LEDS):
+        strip[i] = (0, 0, 0)
+    if 0 <= led_i < NUM_LEDS:
+        lh = None
+        for item in lighthouses:
+            if int(item.get("led", -1)) == led_i:
+                lh = item
+                break
+        if lh:
+            color = frame_color(lh, time.ticks_ms()) or light_color(lh)
+        else:
+            color = (255, 180, 60)
+        strip[led_i] = scale_color(color)
+    strip.write()
+
+
+def _tour_lights():
+    items = []
+    for lh in lighthouses:
+        if lh.get("skip"):
+            continue
+        try:
+            led_i = int(lh.get("led", -1))
+        except Exception:
+            continue
+        if 0 <= led_i < NUM_LEDS:
+            items.append(lh)
+    return items
+
+
+def _tour_label(lh):
+    return str(lh.get("short_name") or lh.get("name") or "").strip()
+
+
+def _light_wx_segments(lh):
+    name = _tour_label(lh)
+    if not name:
+        return []
+    info = station_for(lh) or {}
+    cat = str(info.get("category") or "").strip().upper()
+    color = CATEGORY_COLOR.get(cat) or CATEGORY_COLOR[""]
+    segs = [(name, color)]
+    for code in wx_codes(info.get("raw") or ""):
+        segs.append((WX_LABEL.get(code, code), WX_COLOR.get(code) or (255, 255, 255)))
+    return segs
+
+
+def _tour_refresh_screens():
+    global _matrix_need_text, _matrix_hold_key, _oled_msgs, _oled_msg_i, _oled_x, _oled_title_x, _oled_pass, _oled_hold_key, _matrix_idle_until
+    _matrix_need_text = True
+    _matrix_hold_key = ""
+    _matrix_idle_until = 0
+    _oled_msgs = []
+    _oled_msg_i = 0
+    _oled_x = 128
+    _oled_title_x = 128
+    _oled_pass = 0
+    _oled_hold_key = ""
+
+
+def tour_tick():
+    global _tour_phase, _tour_until, _tour_step, _matrix_ip_done
+    now = time.ticks_ms()
+    if LIGHT_SHOW != "TOUR":
+        if _tour_phase != "normal":
+            _tour_phase = "normal"
+            _tour_step = 0
+            _tour_until = 0
+            _tour_refresh_screens()
+        return
+    if _identify_led is not None or in_sleep_window():
+        return
+    if not _tour_until:
+        _tour_phase = "normal"
+        _tour_until = time.ticks_add(now, TOUR_NORMAL_MS)
+        return
+    if time.ticks_diff(_tour_until, now) > 0:
+        return
+    items = _tour_lights()
+    if _tour_phase == "normal":
+        _tour_phase = "dark"
+        _tour_step = 0
+        _tour_until = time.ticks_add(now, TOUR_DARK_MS)
+        _matrix_ip_done = True
+        _tour_refresh_screens()
+    elif _tour_phase == "dark":
+        if not items:
+            _tour_phase = "normal"
+            _tour_until = time.ticks_add(now, TOUR_NORMAL_MS)
+        else:
+            _tour_phase = "populate"
+            _tour_step = 0
+            _tour_until = time.ticks_add(now, TOUR_STEP_MS)
+            _tour_refresh_screens()
+    else:
+        _tour_step += 1
+        if _tour_step >= len(items):
+            _tour_phase = "normal"
+            _tour_step = 0
+            _tour_until = time.ticks_add(now, TOUR_NORMAL_MS)
+        else:
+            _tour_until = time.ticks_add(now, TOUR_STEP_MS)
+        _tour_refresh_screens()
+
+
+def _revealed_leds():
+    if LIGHT_SHOW != "TOUR":
+        return None
+    if _tour_phase == "dark":
+        return set()
+    items = _tour_lights()
+    if _tour_phase == "populate":
+        step = _tour_step
+        if step < 0:
+            step = 0
+        return {int(lh.get("led")) for lh in items[: step + 1]}
+    return None
+
+
+def _tour_current():
+    if _tour_phase != "populate":
+        return None
+    items = _tour_lights()
+    if not items:
+        return None
+    step = _tour_step
+    if step < 0:
+        step = 0
+    if step >= len(items):
+        step = len(items) - 1
+    return items[step]
+
+
+def render_frame():
+    global _identify_led
+    now_ms = time.ticks_ms()
+    tour_tick()
+    if _identify_led is not None:
+        if time.ticks_diff(_identify_until, now_ms) <= 0:
+            _identify_led = None
+        else:
+            _ldr_refresh()
+            paint_identify(_identify_led)
+            return
+    if in_sleep_window():
+        paint_all((0, 0, 0))
+        return
+    _ldr_refresh()
+    revealed = _revealed_leds()
+    used = {}
+    for lh in lighthouses:
+        led_i = int(lh.get("led", 0))
+        if led_i < 0 or led_i >= NUM_LEDS:
+            continue
+        if lh.get("skip") or (revealed is not None and led_i not in revealed):
+            strip[led_i] = (0, 0, 0)
+            used[led_i] = True
+            continue
+        color = frame_color(lh, now_ms)
+        if color:
+            strip[led_i] = scale_color(color)
+        else:
+            strip[led_i] = (0, 0, 0)
+        used[led_i] = True
+    for i in range(NUM_LEDS):
+        if i not in used:
+            strip[i] = (0, 0, 0)
+    strip.write()
+
+
+_http_poll = None
+
+
+def _listen_http(port):
+    s = socket.socket()
+    s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    s.bind(("0.0.0.0", port))
+    s.listen(2)
+    s.settimeout(0)
+    return s
+
+
+def start_http():
+    global http_sock, http_sock_8080, _http_poll
+    import select
+    http_sock = _listen_http(80)
+    try:
+        http_sock_8080 = _listen_http(8080)
+        print("HTTP on port 80 and 8080")
+    except Exception as e:
+        http_sock_8080 = None
+        print("HTTP on port 80 (8080 failed:", e, ")")
+    _http_poll = select.poll()
+    _http_poll.register(http_sock, select.POLLIN)
+    if http_sock_8080 is not None:
+        _http_poll.register(http_sock_8080, select.POLLIN)
+    ip = status.get("ip")
+    if ip:
+        print("Open http://%s/  or  http://%s:8080/" % (ip, ip))
+
+
+def stop_http():
+    global http_sock, http_sock_8080, _http_poll
+    _http_poll = None
+    for s in (http_sock, http_sock_8080):
+        if s is None:
+            continue
+        try:
+            s.close()
+        except Exception:
+            pass
+    http_sock = None
+    http_sock_8080 = None
+
+
+def restart_http():
+    stop_http()
+    time.sleep_ms(40)
+    try:
+        start_http()
+    except Exception as e:
+        print("HTTP restart:", e)
+
+
+def lighthouse_payload():
+    return list(lighthouses)
+
+
+def apply_lighthouse_list(items):
+    global lighthouses, NUM_LEDS
+    if not isinstance(items, list):
+        return 0
+    import wifi_manager
+    cleaned = wifi_manager.save_lighthouse_list(items)
+    lighthouses = cleaned
+    n = max(1, len(cleaned))
+    if n != NUM_LEDS:
+        NUM_LEDS = n
+        init_strip()
+        try:
+            cfg = load_config()
+            cfg["num_leds"] = n
+            with open(CONFIG_FILE, "w") as cf:
+                json.dump(cfg, cf)
+        except Exception as e:
+            print("num_leds save:", e)
+    print("Saved", len(cleaned), "lighthouses")
+    return len(cleaned)
+
+
+def read_http(conn):
+    conn.settimeout(2)
+    data = b""
+    while b"\r\n\r\n" not in data:
+        chunk = conn.recv(1024)
+        if not chunk:
+            break
+        data += chunk
+        if len(data) > 16384:
+            break
+    if b"\r\n\r\n" not in data:
+        return data.decode(), ""
+    header, body = data.split(b"\r\n\r\n", 1)
+    clen = 0
+    for line in header.split(b"\r\n"):
+        if line.lower().startswith(b"content-length:"):
+            try:
+                clen = int(line.split(b":", 1)[1].strip())
+            except Exception:
+                clen = 0
+    while len(body) < clen:
+        more = conn.recv(1024)
+        if not more:
+            break
+        body += more
+    try:
+        return header.decode(), body.decode()
+    except Exception:
+        return "", ""
+
+
+def _http_send(conn, content_type, body, status="200 OK"):
+    if isinstance(body, str):
+        body = body.encode()
+    hdr = (
+        "HTTP/1.1 %s\r\nContent-Type: %s\r\nContent-Length: %d\r\n"
+        "Connection: close\r\nAccess-Control-Allow-Origin: *\r\n\r\n"
+        % (status, content_type, len(body))
+    )
+    data = hdr.encode() + body
+    while data:
+        sent = conn.send(data)
+        if not sent:
+            break
+        data = data[sent:]
+
+
+def _handle_start_update(conn):
+    global update_available, update_info
+    try:
+        import updater
+        if update_available and update_info:
+            has_update = True
+            version_info = update_info
+        else:
+            has_update, version_info = updater.check_for_new_version(FIRMWARE_VERSION)
+            update_available = has_update
+            update_info = version_info
+        if has_update and version_info:
+            _http_send(conn, "text/plain", "Installing...", "200 OK")
+            try:
+                conn.close()
+            except Exception:
+                pass
+            time.sleep_ms(200)
+            updater.install_pending_update(version_info)
+            return
+        print("OTA POST /start-update: no newer firmware")
+        _http_send(conn, "text/plain", "No update available.", "409 Conflict")
+    except Exception as e:
+        print("OTA POST /start-update error:", e)
+        try:
+            _http_send(conn, "text/plain", "Update error.", "500 Internal Server Error")
+        except Exception:
+            pass
+
+
+def _ota_scroll_text():
+    ver = ""
+    if update_info:
+        ver = str(update_info.get("version") or "")
+    if ver:
+        return "UPDATE AVAILABLE " + ver + "  PRESS BUTTON"
+    return "UPDATE AVAILABLE PRESS BUTTON"
+
+
+def _announce_ota():
+    global _oled_msgs, _oled_msg_i, _oled_x, _oled_title_x, _oled_blank_until, _oled_pass, _oled_hold_key, _matrix_need_text, _matrix_hold_key, _ota_scroll_pending
+    if _ota_banner_done:
+        return
+    _ota_scroll_pending = True
+    _oled_blank_until = 0
+    _oled_msgs = [("UPDATE", _ota_scroll_text())]
+    _oled_msg_i = 0
+    _oled_x = 128
+    _oled_title_x = 128
+    _oled_pass = 0
+    _oled_hold_key = ""
+    _matrix_need_text = True
+    _matrix_hold_key = ""
+    try:
+        paint_all((255, 140, 0))
+    except Exception:
+        pass
+    if oled is not None:
+        try:
+            oled.fill(0)
+            _oled_print_centered(OLED_TITLE_Y, "UPDATE")
+            _oled_print_centered(OLED_BODY_Y, "PRESS BTN")
+            oled.show()
+        except Exception:
+            pass
+
+
+def check_for_ota():
+    global update_available, update_info
+    _release_wifi_manager()
+    print("OTA: checking for newer firmware...")
+    try:
+        import updater
+        has_update, version_info = updater.check_for_new_version(FIRMWARE_VERSION)
+        update_available = has_update
+        update_info = version_info
+        if has_update:
+            print("OTA: new version", version_info.get("version"), "- install from the app, browser, or a short tap on the setup button")
+            _announce_ota()
+        else:
+            print("OTA: device firmware current (or check unreachable)")
+    except Exception as e:
+        print("OTA check error:", e)
+        update_available = False
+        update_info = None
+
+
+def init_ota_button():
+    global _ota_btn
+    try:
+        _ota_btn = machine.Pin(FORCE_AP_BUTTON_PIN, machine.Pin.IN, machine.Pin.PULL_UP)
+    except Exception as e:
+        _ota_btn = None
+        print("OTA button skipped:", e)
+
+
+def poll_ota_button():
+    global _ota_down_ms
+    if _ota_btn is None:
+        return
+    pressed = _ota_btn.value() == 0
+    now = time.ticks_ms()
+    if pressed:
+        if _ota_down_ms is None:
+            _ota_down_ms = now
+        elif time.ticks_diff(now, _ota_down_ms) >= 3000:
+            print("Setup button held 3s — reboot to AP")
+            _ota_down_ms = None
+            request_force_ap_reboot()
+        return
+    if _ota_down_ms is None:
+        return
+    held = time.ticks_diff(now, _ota_down_ms)
+    _ota_down_ms = None
+    if not update_available or held < 40 or held > 1500:
+        return
+    print("OTA: setup button tap - installing")
+    try:
+        import updater
+        updater.install_pending_update(update_info)
+    except Exception as e:
+        print("OTA button install:", e)
+
+
+def _request_path(line):
+    parts = line.split()
+    if len(parts) < 2:
+        return "/"
+    return parts[1].split("?", 1)[0]
+
+
+def _request_query(line):
+    parts = line.split()
+    if len(parts) < 2 or "?" not in parts[1]:
+        return ""
+    return parts[1].split("?", 1)[1]
+
+
+def _query_int(query, key, default=None):
+    for pair in (query or "").split("&"):
+        if "=" not in pair:
+            continue
+        k, v = pair.split("=", 1)
+        if k == key:
+            try:
+                return int(v)
+            except Exception:
+                return default
+    return default
+
+
+def handle_http():
+    if _http_poll is None:
+        return
+    try:
+        ready = _http_poll.poll(20)
+    except Exception as e:
+        print("HTTP poll", e)
+        return
+    for sock, _event in ready:
+        try:
+            conn, _addr = sock.accept()
+        except OSError:
+            continue
+        _handle_conn(conn)
+
+
+def _handle_conn(conn):
+    global _matrix_need_text
+    try:
+        header, req_body = read_http(conn)
+        line = header.split("\r\n", 1)[0] if header else ""
+        path = _request_path(line)
+        query = _request_query(line)
+        method = line.split(" ", 1)[0] if line else "GET"
+        if method == "OPTIONS":
+            import wifi_manager
+            wifi_manager.send_options(conn)
+        elif method == "GET" and path == "/help":
+            import wifi_manager
+            wifi_manager.send_static_file(
+                conn,
+                "help.html",
+                "text/html; charset=utf-8",
+                "<p>Copy help.html to the chart, then reload.</p>",
+            )
+        elif method == "GET" and path == "/catalog":
+            import wifi_manager
+            wifi_manager.send_json_file(conn, "catalog.json", {"ok": False, "lighthouses": []})
+        elif method == "GET" and path == "/lighthouses-defaults":
+            import wifi_manager
+            wifi_manager.send_json_file(conn, "lighthouses_defaults.json", {"ok": False, "lighthouses": []})
+        elif path == "/identify":
+            led = None
+            hold = 8000
+            try:
+                if req_body and req_body.lstrip()[:1] == "{":
+                    payload = json.loads(req_body)
+                    if "led" in payload:
+                        led = int(payload.get("led"))
+                    hold = int(payload.get("ms", hold))
+            except Exception:
+                pass
+            if led is None:
+                led = _query_int(query, "led")
+            qms = _query_int(query, "ms")
+            if qms is not None:
+                hold = qms
+            if led is None or int(led) < 0:
+                clear_identify()
+                _http_send(conn, "application/json", json.dumps({"ok": True, "identifying": False}))
+            else:
+                ms = start_identify(int(led), hold)
+                _http_send(conn, "application/json", json.dumps({"ok": True, "identifying": True, "led": int(led), "ms": ms}))
+        elif method == "GET" and path == "/lighthouses":
+            _http_send(conn, "application/json", json.dumps({"ok": True, "lighthouses": lighthouse_payload(), "num_leds": NUM_LEDS}))
+        elif method == "POST" and path == "/lighthouses":
+            try:
+                import wifi_manager
+                if req_body and req_body.lstrip()[:1] == "{":
+                    payload = json.loads(req_body)
+                else:
+                    payload = wifi_manager.parse_body("\r\n\r\n" + (req_body or ""))
+                items = payload.get("lighthouses") if isinstance(payload, dict) else payload
+                if isinstance(items, str):
+                    items = json.loads(items)
+                count = apply_lighthouse_list(items)
+                if req_body and req_body.lstrip()[:1] == "{":
+                    _http_send(conn, "application/json", json.dumps({"ok": True, "count": count, "num_leds": NUM_LEDS, "message": "saved"}))
+                else:
+                    import wifi_manager
+                    _http_send(conn, "text/html; charset=utf-8", wifi_manager.setup_page(update_available, (update_info or {}).get("version", ""), FIRMWARE_VERSION))
+            except Exception as e:
+                _http_send(conn, "application/json", json.dumps({"ok": False, "message": str(e)}))
+        elif method == "GET" and path == "/status":
+            _http_send(conn, "application/json", json.dumps({
+                "ok": True,
+                "name": "GreatLakesLighthouses",
+                "version": FIRMWARE_VERSION,
+                "ip": status.get("ip"),
+                "last_fetch": status.get("last_fetch"),
+                "stations": list((status.get("stations") or {}).keys()),
+                "lights": len(lighthouses),
+                "num_leds": NUM_LEDS,
+                "update_available": update_available,
+                "update_version": (update_info or {}).get("version", "") if update_available else "",
+            }))
+        elif method == "GET" and path == "/config":
+            import wifi_manager
+            out = wifi_manager.merge_defaults(load_config())
+            out.pop("password", None)
+            out["ok"] = True
+            out["version"] = FIRMWARE_VERSION
+            out["name"] = "GreatLakesLighthouses"
+            out["update_available"] = update_available
+            if update_info:
+                out["update_version"] = update_info.get("version", "")
+            _http_send(conn, "application/json", json.dumps(out))
+        elif method == "POST" and path == "/start-update":
+            _handle_start_update(conn)
+        elif method == "POST" and path in ("/update-config", "/configure"):
+            import wifi_manager
+            is_json = bool(req_body) and req_body.lstrip()[:1] == "{"
+            try:
+                if is_json:
+                    payload = json.loads(req_body) if req_body else {}
+                else:
+                    payload = wifi_manager.parse_body("\r\n\r\n" + (req_body or ""))
+                    if "beacon_pulse" not in payload:
+                        payload["beacon_pulse"] = False
+                    if "sleep_enabled" not in payload:
+                        payload["sleep_enabled"] = False
+                    if "weekend_mode_enabled" not in payload:
+                        payload["weekend_mode_enabled"] = False
+                if not isinstance(payload, dict):
+                    raise ValueError("object required")
+                old_pin = LED_PIN
+                cfg = wifi_manager.merge_defaults(load_config())
+                wifi_manager.apply_fields(cfg, payload)
+                wifi_manager.save_config(cfg)
+                load_config()
+                _matrix_need_text = True
+                if LED_PIN != old_pin:
+                    init_strip()
+                reboot = (not is_json) or str(payload.get("reboot", "")).lower() in ("1", "true", "yes")
+                if is_json:
+                    _http_send(conn, "application/json", json.dumps({"ok": True, "message": "saved", "version": FIRMWARE_VERSION}))
+                else:
+                    _http_send(conn, "text/html; charset=utf-8", wifi_manager.success_page(True, status.get("ip")))
+                if reboot:
+                    conn.close()
+                    time.sleep(1)
+                    machine.reset()
+                    return
+            except Exception as e:
+                if is_json:
+                    _http_send(conn, "application/json", json.dumps({"ok": False, "message": str(e)}))
+                else:
+                    _http_send(conn, "text/html; charset=utf-8", "<p>Save failed: %s</p>" % e)
+        elif method == "POST" and path == "/reboot":
+            _http_send(conn, "application/json", json.dumps({"ok": True, "message": "rebooting"}))
+            conn.close()
+            time.sleep(1)
+            machine.reset()
+            return
+        elif method == "GET" and path in ("/", "/index.html"):
+            import wifi_manager
+            _http_send(conn, "text/html; charset=utf-8", wifi_manager.setup_page(update_available, (update_info or {}).get("version", ""), FIRMWARE_VERSION))
+        elif method == "GET" and path == "/favicon.ico":
+            _http_send(conn, "text/plain", "")
+        else:
+            _http_send(conn, "application/json", json.dumps({"ok": True, "see": ["/status", "/lighthouses", "/catalog", "/config"]}))
+    except Exception as e:
+        print("HTTP", e)
+        try:
+            _http_send(conn, "text/plain", "HTTP error: %s" % e)
+        except Exception:
+            pass
+    try:
+        conn.close()
+    except Exception:
+        pass
+
+
+oled = None
+_oled_wri = None
+_oled_wri_body = None
+_oled_last_ms = 0
+_oled_msgs = []
+_oled_msg_i = 0
+_oled_x = 128
+_oled_title_x = 128
+_oled_blank_until = 0
+_oled_pass = 0
+_oled_hold_key = ""
+_matrix_need_text = True
+_matrix_hold_key = ""
+_matrix_ip_done = False
+_matrix_idle_until = 0
+_matrix_idle_pass = False
+
+
+def init_matrix():
+    global _matrix_need_text
+    if not _uses_matrix():
+        return
+    try:
+        import led_matrix
+        if led_matrix.init():
+            _matrix_need_text = True
+    except Exception as e:
+        print("LED matrix skipped:", e)
+
+
+def _matrix_light_segments():
+    segs = []
+    weather_only = MATRIX_SCROLL == "WEATHER"
+    first = True
+    for lh in lighthouses:
+        if lh.get("skip"):
+            continue
+        parts = _light_wx_segments(lh)
+        if not parts:
+            continue
+        if weather_only and len(parts) < 2:
+            continue
+        if not first:
+            segs.append(("-", (255, 180, 48)))
+        first = False
+        segs.extend(parts)
+    return segs
+
+
+def _seg_key(segs):
+    return "|".join("%s%s" % (t, c) for t, c in segs)
+
+
+def refresh_matrix():
+    global _matrix_need_text, _matrix_hold_key, _matrix_ip_done, _matrix_idle_until, _matrix_idle_pass, _ota_banner_done, _ota_scroll_pending
+    try:
+        import led_matrix
+    except ImportError:
+        return
+    if not led_matrix.active():
+        return
+    led_matrix.set_scroll_ms(197 - 17 * MATRIX_SCROLL_SPEED)
+    led_matrix.set_scroll_times(SCROLL_TIMES)
+    if in_sleep_window():
+        led_matrix.tick(0, True)
+        return
+    now = time.ticks_ms()
+    segs = []
+    current = _tour_current()
+    if _ota_scroll_pending:
+        segs.append((_ota_scroll_text(), (255, 140, 0)))
+    elif current is not None:
+        segs.extend(_light_wx_segments(current))
+    elif _tour_phase == "dark":
+        pass
+    elif not _matrix_ip_done:
+        ip = status.get("ip")
+        if ip:
+            segs.append((str(ip), (255, 180, 48)))
+        else:
+            segs.extend(_matrix_light_segments())
+    else:
+        segs.extend(_matrix_light_segments())
+    idle = not segs
+    if idle and _tour_phase in ("dark", "populate"):
+        if _matrix_need_text or _matrix_hold_key:
+            led_matrix.set_segments([])
+            _matrix_need_text = False
+            _matrix_hold_key = ""
+        led_matrix.tick(_pwm_from_slider(_ldr_level()), True)
+        return
+    if idle:
+        if _matrix_idle_until and time.ticks_diff(now, _matrix_idle_until) < 0:
+            return
+        if _matrix_idle_until:
+            _matrix_hold_key = ""
+            _matrix_need_text = True
+            _matrix_idle_until = 0
+        segs = [("GREAT LAKES LIGHTHOUSES", MATRIX_IDLE_COLOR)]
+    else:
+        _matrix_idle_until = 0
+    key = _seg_key(segs)
+    if key and key == _matrix_hold_key:
+        return
+    if _matrix_need_text:
+        led_matrix.set_segments(segs)
+        _matrix_need_text = False
+        _matrix_idle_pass = idle
+    pwm = _pwm_from_slider(_ldr_level())
+    if led_matrix.tick(pwm, False):
+        _matrix_hold_key = key
+        _matrix_need_text = True
+        if _ota_scroll_pending:
+            _ota_scroll_pending = False
+            _ota_banner_done = True
+        ip = status.get("ip")
+        if ip and len(segs) == 1 and segs[0][0] == str(ip):
+            _matrix_ip_done = True
+        if _matrix_idle_pass:
+            _matrix_idle_until = time.ticks_add(now, MATRIX_IDLE_MS)
+            led_matrix.set_segments([])
+
+
+def init_oled():
+    global oled, _oled_wri, _oled_wri_body
+    _oled_wri = None
+    _oled_wri_body = None
+    if not _uses_oled():
+        oled = None
+        return
+    try:
+        import ssd1306
+        sda = machine.Pin(OLED_SDA_PIN, machine.Pin.OPEN_DRAIN, machine.Pin.PULL_UP)
+        scl = machine.Pin(OLED_SCL_PIN, machine.Pin.OPEN_DRAIN, machine.Pin.PULL_UP)
+        i2c = None
+        found = []
+        try:
+            hw = machine.I2C(0, sda=sda, scl=scl, freq=400000)
+            found = hw.scan()
+            if found:
+                i2c = hw
+        except Exception as e:
+            print("OLED hardware I2C:", e)
+        if not found:
+            i2c = machine.SoftI2C(sda=sda, scl=scl, freq=100000)
+            found = i2c.scan()
+        print("OLED I2C", [hex(a) for a in found])
+        if 0x3C in found:
+            addr = 0x3C
+        elif 0x3D in found:
+            addr = 0x3D
+        else:
+            raise OSError("no SSD1306 on D4/D5 (SDA %s SCL %s)" % (OLED_SDA_PIN, OLED_SCL_PIN))
+        oled = ssd1306.SSD1306_I2C(128, 64, i2c, addr)
+        _load_oled_fonts()
+        oled.contrast(128)
+        oled.fill(0)
+        # Dual-color 128x64: yellow y=0-15 sans18, blue y=16-63 sans20.
+        _oled_print_centered(OLED_TITLE_Y, "Lighthouses")
+        _oled_print(OLED_BODY_Y, "v" + FIRMWARE_VERSION)
+        oled.show()
+        body = "sans20" if sans20_available else ("sans18" if fonts_available else "8x8")
+        print("OLED on SDA", OLED_SDA_PIN, "SCL", OLED_SCL_PIN, "addr", hex(addr), "title sans18 body", body)
+    except Exception as e:
+        oled = None
+        _oled_wri = None
+        _oled_wri_body = None
+        print("OLED skipped:", e)
+
+
+def _oled_make_writer(font):
+    try:
+        try:
+            w = writer.Writer(oled, font, verbose=False)
+        except TypeError:
+            w = writer.Writer(oled, font)
+        if hasattr(w, "row_clip"):
+            w.row_clip = True
+        return w
+    except Exception as e:
+        print("OLED writer:", e)
+        return None
+
+
+def _oled_writer(y=OLED_TITLE_Y):
+    global _oled_wri, _oled_wri_body
+    if oled is None or not fonts_available:
+        return None
+    if y >= 16 and sans20_available:
+        if _oled_wri_body is None:
+            _oled_wri_body = _oled_make_writer(sans20)
+        if _oled_wri_body is not None:
+            return _oled_wri_body
+    if _oled_wri is None:
+        _oled_wri = _oled_make_writer(sans18)
+    return _oled_wri
+
+
+def _oled_print(y, text):
+    text = str(text)
+    w = _oled_writer(y)
+    if w is None:
+        oled.text(text[:16], 0, y, 1)
+        return
+    # Same Writer as MarksMetarMap: set_textpos(x, y), not (row, col).
+    try:
+        w.set_textpos(0, y)
+    except Exception:
+        try:
+            writer.Writer.set_textpos(oled, 0, y)
+        except Exception:
+            oled.text(text[:16], 0, y, 1)
+            return
+    w.printstring(text)
+
+
+def _oled_ch_w(ch, y=OLED_TITLE_Y):
+    w = _oled_writer(y)
+    if w is not None:
+        try:
+            n = w.stringlen(ch)
+            if n > 0:
+                return n
+        except Exception:
+            pass
+    return 11 if fonts_available else 8
+
+
+def _oled_str_w(text, y=OLED_TITLE_Y):
+    n = 0
+    for ch in text:
+        n += _oled_ch_w(ch, y)
+    return n
+
+
+def _oled_print_at(x, y, text):
+    # Draw only glyphs that fit on this row. Writer wraps a too-wide
+    # character onto the next line (left side, under the scroll).
+    w = _oled_writer(y)
+    cx = x
+    for ch in text:
+        cw = _oled_ch_w(ch, y)
+        nxt = cx + cw
+        if nxt <= 0:
+            cx = nxt
+            continue
+        if cx >= 128:
+            break
+        if cx >= 0 and nxt <= 128:
+            if w is not None:
+                try:
+                    w.set_textpos(cx, y)
+                    w.printstring(ch)
+                except Exception:
+                    pass
+            else:
+                oled.text(ch, cx, y, 1)
+        cx = nxt
+
+
+def _oled_print_centered(y, text):
+    text = str(text)
+    tw = _oled_str_w(text, y)
+    x = 0 if tw >= 128 else (128 - tw) // 2
+    _oled_print_at(x, y, text)
+
+
+def _oled_draw_title(title):
+    global _oled_title_x
+    title = str(title)
+    tw = _oled_str_w(title, OLED_TITLE_Y)
+    if tw <= 128:
+        _oled_print_centered(OLED_TITLE_Y, title)
+        return
+    _oled_print_at(_oled_title_x, OLED_TITLE_Y, title)
+    _oled_title_x -= max(2, MATRIX_SCROLL_SPEED)
+    if _oled_title_x + tw < 0:
+        _oled_title_x = 128
+
+
+def _oled_messages():
+    current = _tour_current()
+    if current is not None:
+        parts = [text for text, _color in _light_wx_segments(current)]
+        if parts:
+            return [("Lighthouses", "  ".join(parts))]
+    if _tour_phase == "dark":
+        return [("Lighthouses", "")]
+    if not _matrix_ip_done:
+        ip = status.get("ip")
+        if ip:
+            return [("IP", str(ip))]
+    msgs = []
+    cur = []
+    for text, _color in _matrix_light_segments():
+        if text == "-":
+            if cur:
+                msgs.append((cur[0], "  ".join(cur)))
+                cur = []
+            continue
+        cur.append(text)
+    if cur:
+        msgs.append((cur[0], "  ".join(cur)))
+    if not msgs:
+        if _tour_phase in ("dark", "populate"):
+            return [("Lighthouses", "")]
+        msgs.append(("Lighthouses", "GREAT LAKES LIGHTHOUSES"))
+    return msgs
+
+
+def refresh_oled():
+    global _oled_last_ms, _oled_msgs, _oled_msg_i, _oled_x, _oled_title_x, _oled_blank_until, _oled_pass, _oled_hold_key, _matrix_ip_done, _ota_banner_done, _ota_scroll_pending
+    if oled is None:
+        return
+    now = time.ticks_ms()
+    if in_sleep_window():
+        if _oled_last_ms and time.ticks_diff(now, _oled_last_ms) < 1000:
+            return
+        _oled_last_ms = now
+        try:
+            oled.fill(0)
+            _oled_print_centered(OLED_TITLE_Y, "Sleep")
+            oled.show()
+        except Exception as e:
+            print("OLED:", e)
+        return
+    if _oled_blank_until and time.ticks_diff(now, _oled_blank_until) < 0:
+        return
+    if _oled_blank_until:
+        _oled_blank_until = 0
+        _oled_x = 128
+    step_ms = max(40, 140 - 10 * MATRIX_SCROLL_SPEED)
+    if _oled_last_ms and time.ticks_diff(now, _oled_last_ms) < step_ms:
+        return
+    _oled_last_ms = now
+    try:
+        if not _oled_msgs or _oled_msg_i >= len(_oled_msgs):
+            incoming = _oled_messages()
+            ik = "|".join("%s/%s" % (t, m) for t, m in incoming)
+            if _oled_hold_key and ik == _oled_hold_key:
+                oled.fill(0)
+                _oled_print_centered(OLED_TITLE_Y, "Lighthouses")
+                oled.show()
+                return
+            _oled_msgs = incoming
+            _oled_hold_key = ""
+            _oled_msg_i = 0
+            _oled_x = 128
+            _oled_title_x = 128
+            _oled_pass = 0
+        title, msg = _oled_msgs[_oled_msg_i]
+        tw = _oled_str_w(msg, OLED_BODY_Y)
+        oled.fill(0)
+        _oled_draw_title(title)
+        if _oled_x < 128 and _oled_x + tw > 0:
+            _oled_print_at(_oled_x, OLED_BODY_Y, msg)
+        oled.show()
+        _oled_x -= max(2, MATRIX_SCROLL_SPEED)
+        if _oled_x + tw < 0:
+            oled.fill(0)
+            if _oled_str_w(title, OLED_TITLE_Y) <= 128:
+                _oled_print_centered(OLED_TITLE_Y, title)
+            else:
+                _oled_print_at(0, OLED_TITLE_Y, title)
+            oled.show()
+            if title == "UPDATE":
+                pause = 400
+                _ota_scroll_pending = False
+                _ota_banner_done = True
+            elif msg == "GREAT LAKES LIGHTHOUSES":
+                pause = MATRIX_IDLE_MS
+            else:
+                pause = 800
+            _oled_pass += 1
+            if _oled_pass < SCROLL_TIMES:
+                _oled_x = 128
+                _oled_title_x = 128
+                return
+            _oled_blank_until = time.ticks_add(now, pause)
+            _oled_msg_i += 1
+            _oled_x = 128
+            _oled_title_x = 128
+            _oled_pass = 0
+            if _oled_msg_i >= len(_oled_msgs):
+                idle_msg = len(_oled_msgs) == 1 and _oled_msgs[0][1] == "GREAT LAKES LIGHTHOUSES"
+                if idle_msg:
+                    _oled_hold_key = ""
+                else:
+                    _oled_hold_key = "|".join("%s/%s" % (t, m) for t, m in _oled_msgs)
+                if len(_oled_msgs) == 1 and _oled_msgs[0][0] == "IP":
+                    _matrix_ip_done = True
+                _oled_msgs = []
+    except Exception as e:
+        print("OLED:", e)
+
+
+def _ldr_power_on():
+    if not LDR_DRIVE_PIN:
+        return
+    try:
+        machine.Pin(LDR_DRIVE_PIN, machine.Pin.OUT, value=1)
+    except Exception as e:
+        print("LDR power:", e)
+
+
+def init_ldr():
+    global ldr_adc
+    ldr_adc = None
+    _ldr_power_on()
+    if not LDR_ADC_PIN:
+        print("LDR not fitted — brightness stays at max")
+        return
+    try:
+        time.sleep_ms(500)
+        ldr_adc = machine.ADC(machine.Pin(LDR_ADC_PIN))
+        try:
+            ldr_adc.atten(machine.ADC.ATTN_11DB)
+        except Exception:
+            pass
+        level = _ldr_refresh()
+        print("LDR input GPIO", LDR_ADC_PIN, "power GPIO", LDR_DRIVE_PIN, "now", _ldr_raw, "->", level)
+    except Exception as e:
+        ldr_adc = None
+        print("LDR skipped:", e)
+
+
+def main():
+    print("Great Lakes Lighthouses", FIRMWARE_VERSION)
+    _ldr_power_on()
+    cfg = load_config()
+    held = consume_force_ap_flag() or force_ap_held()
+    if held or not cfg.get("ssid"):
+        import wifi_manager
+        wifi_manager.start(force_ap=held or not cfg.get("ssid"))
+        return
+    if not connect_wifi(cfg):
+        import wifi_manager
+        wifi_manager.start(force_ap=True)
+        return
+    init_strip()
+    init_oled()
+    init_matrix()
+    load_lighthouses()
+    init_ldr()
+    startup_chase()
+    paint_all((40, 30, 0))
+    sync_ntp()
+    gc.collect()
+    fetch_metars()
+    _import_wifi_manager(sleep_cfg)
+    start_http()
+    init_ota_button()
+    gc.collect()
+    stop_http()
+    check_for_ota()
+    restart_http()
+    _release_wifi_manager()
+    gc.collect()
+    print("Running")
+    global _tour_phase, _tour_until, _tour_step, _wifi_just_up
+    _tour_phase = "normal"
+    _tour_step = 0
+    _tour_until = time.ticks_add(time.ticks_ms(), TOUR_NORMAL_MS)
+    last_fetch = time.time()
+    while True:
+        try:
+            wifi_keep()
+            if _wifi_just_up:
+                _wifi_just_up = False
+                if not clock_trusted:
+                    sync_ntp()
+                if not in_sleep_window():
+                    stop_http()
+                    gc.collect()
+                    fetch_metars()
+                    restart_http()
+                last_fetch = time.time()
+                gc.collect()
+            handle_http()
+            poll_ota_button()
+            now = time.time()
+            if now - last_fetch >= CYCLE_DELAY:
+                if not in_sleep_window():
+                    stop_http()
+                    gc.collect()
+                    fetch_metars()
+                    restart_http()
+                    if not update_available:
+                        stop_http()
+                        check_for_ota()
+                        restart_http()
+                last_fetch = now
+                gc.collect()
+            render_frame()
+            refresh_oled()
+            refresh_matrix()
+        except KeyboardInterrupt:
+            raise
+        except Exception as e:
+            print("loop:", e)
+            gc.collect()
+
+
+main()
