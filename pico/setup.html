@@ -1,0 +1,435 @@
+<!DOCTYPE html>
+<html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Great Lakes Lighthouses</title>
+<style>
+body{font-family:Arial,sans-serif;background:#0B1F3A;color:#F4EBD0;margin:0;padding:16px}
+h1{font-size:1.3rem;color:#E8A838}
+h2{font-size:1rem;color:#E8A838;margin-top:18px}
+label{display:block;margin-top:10px;font-size:.9rem}
+input,select{width:100%;box-sizing:border-box;padding:8px;margin-top:4px;border-radius:6px;border:0}
+input[type=range]{padding:0;height:28px;accent-color:#E8A838}
+.row{display:flex;gap:8px}.row>div{flex:1}
+button{margin-top:16px;width:100%;padding:12px;background:#E8A838;border:0;border-radius:8px;font-weight:bold;color:#0B1F3A}
+.note{font-size:.8rem;color:#A8B5C4;margin-top:12px}
+.tabs{display:flex;gap:8px;margin:14px 0}
+.tabs button{margin:0;flex:1;background:#16324F;color:#F4EBD0}
+.tabs button.on{background:#E8A838;color:#0B1F3A}
+.actions{display:flex;gap:8px;flex-wrap:wrap}
+.actions button{width:auto;margin-top:8px;padding:8px 12px}
+.card{background:#16324F;border-radius:10px;padding:10px;margin-top:8px;display:flex;align-items:center;gap:8px}
+.card.skip{opacity:.5}
+.led{min-width:36px;width:36px;height:36px;margin:0;padding:0;border-radius:50%;display:flex;align-items:center;justify-content:center;font-weight:bold;background:rgba(255,236,212,.2);border:0;cursor:pointer}
+.grow{flex:1;min-width:0}
+.amber{color:#E8A838;font-size:.85rem}
+.muted{color:#A8B5C4;font-size:.75rem}
+.tiny{width:auto;margin:0;padding:6px 8px;background:#0B1F3A;color:#F4EBD0}
+.use{display:flex;flex-direction:column;align-items:center;font-size:.7rem;color:#A8B5C4}
+.use input{width:auto;margin:0}
+#overlay{display:none;pointer-events:none;position:fixed;inset:0;background:rgba(0,0,0,.55);padding:16px;overflow:auto;z-index:2}
+#overlay .box{background:#0B1F3A;border:1px solid #E8A838;border-radius:10px;padding:16px;max-width:520px;margin:20px auto}
+#catKinds,#catChips{display:flex;flex-wrap:wrap;gap:6px;margin:8px 0}
+#catKinds .chip,#catChips .chip{width:auto;margin:0;padding:6px 10px;background:#16324F;color:#F4EBD0;border-radius:999px;font-size:.8rem;font-weight:normal}
+#catKinds .chip.on,#catChips .chip.on{background:#E8A838;color:#0B1F3A}
+#catList{max-height:50vh;overflow:auto}
+.hit{background:#16324F;border-radius:8px;padding:8px;margin-top:6px}
+.hit.onmap{opacity:.45}
+.status{color:#E8A838;font-size:.85rem;min-height:1.2em}
+#panelSettings,#panelHelp{display:none;pointer-events:none}
+#panelHelp iframe{pointer-events:none}
+</style></head><body>
+<h1>Great Lakes Lighthouses</h1>
+<p>Open this page on the chart (setup: 192.168.4.1, or the chart LAN IP).</p>
+<div class="tabs">
+<button type="button" id="tabLights" onclick="showTab('lights')">Lighthouses</button>
+<button type="button" id="tabSettings" onclick="showTab('settings')">Chart settings</button>
+<button type="button" id="tabHelp" onclick="showTab('help')">Help</button>
+</div>
+<div id="panelLights">
+<p class="note">List order is LED order (south to north). LED 1 is first on the strip. Skip a light to leave that LED off. Tap an LED number to light only that LED for a few seconds — works on GreatLakes-Setup. Save when the strip matches.</p>
+<div class="actions">
+<button type="button" onclick="saveLights()">Save list</button>
+<button type="button" class="tiny" onclick="loadLights()">Reload</button>
+<button type="button" class="tiny" onclick="restoreDefaults()">Restore defaults</button>
+</div>
+<div class="actions">
+<button type="button" class="tiny" onclick="openCatalog()">Add from catalog</button>
+<button type="button" class="tiny" onclick="openCustom()">Add custom</button>
+</div>
+<p class="status" id="lhStatus"></p>
+<p id="lhCount"></p>
+<div id="lhList"></div>
+</div>
+<div id="panelSettings">
+<form action="/configure" method="post">
+<h2>Home Wi-Fi</h2>
+<label>SSID</label>
+<input name="ssid" value="__SSID__" placeholder="Home or hotel Wi-Fi name" autocomplete="off">
+<label>Password</label>
+<input name="password" type="password" value="" placeholder="Leave blank to keep the current password" autocomplete="off">
+<p class="note">This is the router the chart joins for internet — not GreatLakes-Setup. Leave password blank to keep the one already saved.</p>
+<label>Light show</label>
+<select name="light_show">__SHOW_OPTS__</select>
+<p class="note">Keep flashing leaves every light on its real characteristic. Populate one by one goes dark, then lights each lighthouse in list order with the name on OLED or matrix.</p>
+<div class="row">
+<div><label>All lights flash (seconds)</label><input name="tour_flash_s" type="number" min="10" max="1800" value="__TOUR_FLASH__"></div>
+<div><label>Each light (seconds)</label><input name="tour_step_s" type="number" min="2" max="120" value="__TOUR_STEP__"></div>
+</div>
+<p class="note">Used when Light show is Populate one by one. 180 is 3 minutes of all lights flashing. 10 is 10 seconds per light on OLED or matrix.</p>
+<label>Extra display</label>
+<select name="display_type">__DISPLAY_OPTS__</select>
+<p class="note">Lighthouse strip is always on (D8 / GPIO 8). OLED uses D4 and D5 (GPIO 6 SDA, GPIO 7 SCL) and the board 3.3 V pin. Matrix data is D3 / GPIO 5, powered from 5 V. The light sensor uses D6 (held at 3.3 V) and D2 (input). OLED and matrix can run together.</p>
+<label>LED matrix scroll</label>
+<select name="matrix_scroll">__SCROLL_OPTS__</select>
+<p class="note">IP once at startup. Weather only lists lights with rain/fog/snow/lightning. If none, GREAT LAKES LIGHTHOUSES every 15 seconds.</p>
+<label>Matrix scroll speed <span id="spdN">__SCROLL_SPD__</span></label>
+<input name="matrix_scroll_speed" type="range" min="1" max="10" value="__SCROLL_SPD__" oninput="document.getElementById('spdN').textContent=this.value">
+<p class="note">1 is slow, 10 is fast. 7 matches the original speed. Text enters from the right.</p>
+<label>Scroll times <span id="timesN">__SCROLL_TIMES__</span></label>
+<input name="scroll_times" type="range" min="1" max="10" value="__SCROLL_TIMES__" oninput="document.getElementById('timesN').textContent=this.value">
+<p class="note">How many times each message scrolls across the OLED or matrix. 1 is once, then it waits until the text changes.</p>
+<div class="row">
+<div><label>LED count</label><input name="num_leds" type="number" min="1" max="300" value="__NUM_LEDS__"></div>
+<div><label>Strip data pin</label><select name="led_pin">__GPIO_OPTS__</select></div>
+</div>
+<div class="row">
+<div><label>Min brightness (0-30)</label><input name="min_brightness" type="number" min="0" max="30" value="__MINB__"></div>
+<div><label>Max brightness (1-30)</label><input name="max_brightness" type="number" min="1" max="30" value="__MAXB__"></div>
+</div>
+<p class="note">Max is the bright-room ceiling (1 to 30). Min is the dark-room floor (0 = off, 1–2 is a faint glow).</p>
+<label>Refresh seconds</label>
+<input name="cycle_delay" type="number" min="30" max="3600" value="__CYCLE__">
+<label><input name="beacon_pulse" type="checkbox" value="1" __BEACON__ style="width:auto"> Beacon pulse on clear weather</label>
+<h2>Sleep schedule</h2>
+<label>Time zone</label>
+<p class="note">Sleep times are local. US daylight saving starts the second Sunday in March and ends the first Sunday in November. The chart sets its clock after it joins Wi-Fi.</p>
+<select name="timezone">__TZ_OPTS__</select>
+<label><input name="sleep_enabled" type="checkbox" value="1" __SLEEP__ style="width:auto"> Turn LEDs off at set times</label>
+<div class="row">
+<div><label>Off hour</label><input name="sleep_at_hour" type="number" min="0" max="23" value="__SH__"></div>
+<div><label>Off minute</label><input name="sleep_at_minute" type="number" min="0" max="59" value="__SM__"></div>
+</div>
+<div class="row">
+<div><label>On hour</label><input name="wake_at_hour" type="number" min="0" max="23" value="__WH__"></div>
+<div><label>On minute</label><input name="wake_at_minute" type="number" min="0" max="59" value="__WM__"></div>
+</div>
+<h2>Weekend / long off</h2>
+<label><input name="weekend_mode_enabled" type="checkbox" value="1" __WEEKEND__ style="width:auto"> Extra off block (e.g. Fri 18:00 to Mon 06:00)</label>
+<div class="row">
+<div><label>Off weekday</label><select name="weekend_off_weekday">__WDOFF__</select></div>
+<div><label>Off hour</label><input name="weekend_off_hour" type="number" min="0" max="23" value="__WOH__"></div>
+<div><label>Off minute</label><input name="weekend_off_minute" type="number" min="0" max="59" value="__WOM__"></div>
+</div>
+<div class="row">
+<div><label>On weekday</label><select name="weekend_on_weekday">__WDON__</select></div>
+<div><label>On hour</label><input name="weekend_on_hour" type="number" min="0" max="23" value="__WIH__"></div>
+<div><label>On minute</label><input name="weekend_on_minute" type="number" min="0" max="59" value="__WIM__"></div>
+</div>
+<button type="submit">Save &amp; Reboot</button>
+</form>
+<h2>Firmware update</h2>
+<p><strong>This chart is firmware __FW_VER__</strong></p>
+__UPDATE_BANNER__
+<p class="note">The chart must already be on home Wi-Fi with internet. This does not change your light list or Wi-Fi password. The chart restarts when the update starts. A short press on the setup button also installs.</p>
+<form action="/start-update" method="post">
+<button type="submit">Install firmware update</button>
+</form>
+</div>
+<div id="panelHelp">
+<iframe id="helpFrame" title="Help" style="width:100%;min-height:75vh;border:0;background:#0B1F3A"></iframe>
+</div>
+<div id="overlay" style="display:none;pointer-events:none" onclick="if(event.target.id==='overlay')closeModal()">
+<div class="box" id="modalBox"></div>
+</div>
+<script>
+var lights=[];
+var catalog=null, catShore=null, catKind=null, catQuery='';
+var PRESETS=[
+{char:'F W',color:'W',period_s:1,on_s:[1],off_s:[0],label:'F W - steady white'},
+{char:'F R',color:'R',period_s:1,on_s:[1],off_s:[0],label:'F R - steady red'},
+{char:'F G',color:'G',period_s:1,on_s:[1],off_s:[0],label:'F G - steady green'},
+{char:'Fl W 4s',color:'W',period_s:4,on_s:[0.5],off_s:[3.5],label:'Fl W 4s - white flash 4s'},
+{char:'Fl W 6s',color:'W',period_s:6,on_s:[1],off_s:[5],label:'Fl W 6s - white flash 6s'},
+{char:'Fl R 2.5s',color:'R',period_s:2.5,on_s:[0.5],off_s:[2],label:'Fl R 2.5s - red flash 2.5s'},
+{char:'Fl R 6s',color:'R',period_s:6,on_s:[1],off_s:[5],label:'Fl R 6s - red flash 6s'},
+{char:'Fl R 10s',color:'R',period_s:10,on_s:[1],off_s:[9],label:'Fl R 10s - red flash 10s'},
+{char:'Iso W 6s',color:'W',period_s:6,on_s:[3],off_s:[3],label:'Iso W 6s - white 3s on/off'},
+{char:'Iso R 6s',color:'R',period_s:6,on_s:[3],off_s:[3],label:'Iso R 6s - red 3s on/off'},
+{char:'Fl(2) W 6s',color:'W',period_s:6,on_s:[1,1],off_s:[1,3],label:'Fl(2) W 6s - two white flashes'}
+];
+function showTab(name){
+ document.getElementById('panelLights').style.display=name==='lights'?'block':'none';
+ document.getElementById('panelLights').style.pointerEvents=name==='lights'?'auto':'none';
+ document.getElementById('panelSettings').style.display=name==='settings'?'block':'none';
+ document.getElementById('panelSettings').style.pointerEvents=name==='settings'?'auto':'none';
+ document.getElementById('panelHelp').style.display=name==='help'?'block':'none';
+ document.getElementById('panelHelp').style.pointerEvents=name==='help'?'auto':'none';
+ var fr=document.getElementById('helpFrame');
+ if(fr) fr.style.pointerEvents=name==='help'?'auto':'none';
+ document.getElementById('tabLights').className=name==='lights'?'on':'';
+ document.getElementById('tabSettings').className=name==='settings'?'on':'';
+ document.getElementById('tabHelp').className=name==='help'?'on':'';
+ if(name==='help'){
+  if(fr && !fr.getAttribute('src')) fr.src='/help';
+ }
+}
+function esc(s){return String(s||'').replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');}
+function say(m){document.getElementById('lhStatus').textContent=m||'';}
+function charOf(lh){
+ var a=(lh.light&&lh.light.char)||'';
+ var b=(lh.light_b&&lh.light_b.char)||'';
+ return b?a+' / '+b:a;
+}
+function colorOf(lh){return ((lh.light&&lh.light.color)||'W').toUpperCase();}
+function colorBOf(lh){return ((lh.light_b&&lh.light_b.color)||'').toUpperCase();}
+function swatch(c){return c==='R'?'#E23B3B':c==='G'?'#2ECC71':'#FFECD4';}
+function specFixed(spec){
+ if(!spec) return true;
+ var off=spec.off_s||[0];
+ var on=spec.on_s||[1];
+ return off.length===1 && Number(off[0])<=0 && on.length<=1;
+}
+function colorWord(c){
+ c=String(c||'W').toUpperCase();
+ return c==='R'?'red':c==='G'?'green':'white';
+}
+function ledHint(e){
+ var a=e.light||{};
+ var b=e.light_b;
+ var ca=colorWord(a.color||e.light_color||'W');
+ if(!b) return specFixed(a)?'One LED: steady '+ca:'One LED: flashes '+ca;
+ var cb=colorWord(b.color);
+ if(ca===cb) return specFixed(a)&&specFixed(b)?'One LED: steady '+ca:'One LED: flashes '+ca;
+ return 'One LED: '+ca+', then '+cb;
+}
+function items(data){return (data&&data.lighthouses)||[];}
+function syncLedCount(){
+ var n=document.querySelector('[name=num_leds]');
+ if(n) n.value=Math.max(1,lights.length);
+}
+function render(){
+ var on=0;
+ lights.forEach(function(lh,i){lh.led=i; if(!lh.skip) on++;});
+ document.getElementById('lhCount').textContent='List ('+lights.length+' lights, '+on+' on)';
+ var html='';
+ lights.forEach(function(lh,i){
+  var c=colorOf(lh);
+  var cb=colorBOf(lh);
+  html+='<div class="card'+(lh.skip?' skip':'')+'">';
+  html+='<div><button type="button" class="tiny" onclick="move('+i+',-1)">Up</button><br>';
+  html+='<button type="button" class="tiny" onclick="move('+i+',1)">Down</button></div>';
+  html+='<button type="button" class="led" style="color:'+swatch(c)+';background:'+(cb&&cb!==c?'linear-gradient(90deg,'+swatch(c)+'33,'+swatch(cb)+'33)':swatch(c)+'22')+'" title="Light only this LED" onclick="identify('+i+')">'+(i+1)+'</button>';
+  html+='<div class="grow"><div>'+esc(lh.name||lh.short_name||('LED '+i))+'</div>';
+  html+='<div class="amber">'+esc(charOf(lh)||'-')+'</div>';
+  html+='<div class="muted">'+esc(ledHint(lh))+'</div>';
+  if(lh.metar) html+='<div class="muted">'+esc(lh.metar)+'</div>';
+  html+='</div><label class="use">Use<input type="checkbox" '+(lh.skip?'':'checked')+' onchange="setSkip('+i+',!this.checked)"></label>';
+  html+='<button type="button" class="tiny" onclick="removeAt('+i+')">X</button></div>';
+ });
+ document.getElementById('lhList').innerHTML=html||'<p class="note">No lights yet. Add from the catalog or restore defaults.</p>';
+ syncLedCount();
+}
+function identify(i){
+ say('Lighting LED '+(i+1)+'...');
+ fetch('/identify',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({led:i,ms:4000}),cache:'no-store'})
+  .then(function(r){if(!r.ok) throw new Error('HTTP '+r.status); return r.json();})
+  .then(function(data){say(data.identifying?'LED '+(i+1)+' only for '+Math.round((data.ms||4000)/1000)+'s':'Identify cleared');})
+  .catch(function(e){say('Identify failed: '+e);});
+}
+function move(i,d){var j=i+d; if(j<0||j>=lights.length) return; var t=lights[i]; lights[i]=lights[j]; lights[j]=t; render();}
+function setSkip(i,skip){lights[i].skip=!!skip; render();}
+function removeAt(i){say('Removed '+(lights[i].short_name||lights[i].name||'')); lights.splice(i,1); render();}
+function slug(name){return String(name||'light').toLowerCase().replace(/[^a-z0-9]+/g,'_').replace(/^_|_$/g,'')||'light';}
+function getJson(url,cb,err){
+ fetch(url,{cache:'no-store'}).then(function(r){
+  if(!r.ok) throw new Error('HTTP '+r.status);
+  return r.json();
+ }).then(cb).catch(function(e){if(err)err(e); else say('Failed: '+e);});
+}
+function loadLights(){
+ say('Loading list...');
+ getJson('/lighthouses',function(data){lights=items(data); render(); say('Loaded '+lights.length+' lights');},
+  function(e){say('Could not load /lighthouses: '+e);});
+}
+function saveLights(){
+ lights.forEach(function(lh,i){lh.led=i;});
+ say('Saving...');
+ var body=JSON.stringify({lighthouses:lights});
+ fetch('/lighthouses',{method:'POST',headers:{'Content-Type':'application/json'},body:body,cache:'no-store'})
+  .then(function(r){if(!r.ok) throw new Error('HTTP '+r.status); return r.json();})
+  .then(function(data){say(data.ok?'Saved '+(data.count||lights.length)+' lights. Reboot if the strip length changed.':'Save failed: '+(data.message||''));})
+  .catch(function(){
+   var f=document.createElement('form');
+   f.method='post'; f.action='/lighthouses';
+   var inp=document.createElement('input');
+   inp.type='hidden'; inp.name='lighthouses'; inp.value=body;
+   f.appendChild(inp); document.body.appendChild(f); f.submit();
+  });
+}
+function restoreDefaults(){
+ say('Restoring Kewaunee to Rock Island list...');
+ getJson('/lighthouses-defaults',function(data){
+  var next=items(data);
+  if(!next.length){say('Copy lighthouses_defaults.json to the chart for restore.'); return;}
+  lights=next; render(); say('Restored '+lights.length+' lights. Save list to apply.');
+ });
+}
+function onMap(entry){
+ var members=(entry.pair&&entry.pair.members)||[];
+ return lights.some(function(lh){
+  if(lh.id&&entry.id&&lh.id===entry.id) return true;
+  if(lh.id&&members.indexOf(lh.id)>=0) return true;
+  if(lh.name&&entry.name&&lh.name.toLowerCase()===entry.name.toLowerCase()) return true;
+  return false;
+ });
+}
+function openCatalog(){
+ document.getElementById('modalBox').innerHTML='<h2>Great Lakes catalog</h2><p class="note">Loading...</p>';
+ document.getElementById('overlay').style.display='block';
+ document.getElementById('overlay').style.pointerEvents='auto';
+ var SHORES=[['Chicago','Indiana / Chicago'],['Wisconsin','Wisconsin / Illinois'],['Green Bay','Green Bay'],['Michigan','Michigan'],['Huron','Lake Huron'],['Huron ON','Canada Huron'],['Georgian','Georgian Bay'],['Channel','North Channel'],['Erie','Lake Erie'],['Erie ON','Canada Erie'],['America','Lake America'],['Ontario ON','Canada Ontario'],['Straits','Straits / North'],['Superior','Lake Superior'],['Superior ON','Canada Superior']];
+ function isBuoy(e){
+  return ((e.name||'')+' '+(e.short_name||'')).toLowerCase().indexOf('buoy')>=0;
+ }
+ var numberedAid=/(?:\blight\s+\d+|\bpier\s+no\.?\s*\d+|\s+\d+[a-z]?$)/i;
+ var utilityWords=['marina','bulkhead','abutment','disposal','guidewall','yacht','street','park','jetty','basin','crib','breakwater','shoal','ice boom','dock','academy','club'];
+ function isLighthouse(e){
+  if(isBuoy(e)) return false;
+  var name=String(e.name||'').trim();
+  var short=String(e.short_name||'').trim();
+  if(numberedAid.test(name)||numberedAid.test(short)) return false;
+  var n=(name+' '+short).toLowerCase();
+  for(var u=0;u<utilityWords.length;u++){ if(n.indexOf(utilityWords[u])>=0) return false; }
+  return true;
+ }
+ function isOtherLight(e){ return !isBuoy(e) && !isLighthouse(e); }
+ function matchesKind(e){
+  if(!catKind||catKind==='*') return true;
+  if(catKind==='buoys') return isBuoy(e);
+  if(catKind==='marks') return isOtherLight(e);
+  return isLighthouse(e);
+ }
+ function paint(q){
+  catQuery=q||'';
+  q=catQuery.toLowerCase();
+  var pool=(catalog||[]).filter(matchesKind);
+  function norm(s){return String(s||'').toLowerCase().replace(/[^a-z0-9]+/g,' ').replace(/^\s+|\s+$/g,'');}
+  function words(s){return norm(s).split(' ').filter(function(w){return w;});}
+  var skip={the:1,of:1,and:1,a:1,to:1,light:1,lights:1,lighthouse:1,lighthouses:1,lt:1};
+  var alias={st:'saint',saint:'st',pt:'point',point:'pt',isl:'island',island:'isl',pierhead:'pier',pier:'pierhead',ent:'entrance',entrance:'ent',joe:'joseph',joseph:'joe',harbor:'harbour',harbour:'harbor',mackinaw:'mackinac',mackinac:'mackinaw',betsey:'betsie',betsie:'betsey'};
+  function hitWord(t,hayWords,hay){
+   var vars=[t]; if(alias[t]) vars.push(alias[t]);
+   for(var i=0;i<vars.length;i++){
+    var v=vars[i];
+    if(v.length>=4&&hay.indexOf(v)>=0) return true;
+    for(var j=0;j<hayWords.length;j++){
+     var w=hayWords[j];
+     if(w===v) return true;
+     if(v.length>=2&&w.indexOf(v)===0) return true;
+    }
+   }
+   return false;
+  }
+  var hits=pool.filter(function(e){
+   if(catShore&&catShore!=='*'&&(e.region||'')!==catShore) return false;
+   if(!q) return true;
+   var hay=norm([e.name,e.short_name,e.region,(e.light&&e.light.char)||'',(e.light_b&&e.light_b.char)||'',e.metar,e.metar_name,e.pair&&e.pair.kind==='range'?'front rear range':'',e.pair&&e.pair.kind==='channel'?'green red pair':''].join(' '));
+   if(hay.indexOf(norm(q))>=0) return true;
+   var hw=words(hay);
+   var toks=words(q).filter(function(t){return !skip[t];});
+   if(!toks.length) toks=words(q);
+   return toks.every(function(t){return hitWord(t,hw,hay);});
+  });
+  var show=q||catShore||catKind;
+  var nTowers=(catalog||[]).filter(isLighthouse).length;
+  var nMarks=(catalog||[]).filter(isOtherLight).length;
+  var nBuoys=(catalog||[]).filter(isBuoy).length;
+  var html='<h2>Great Lakes catalog</h2><div id="catKinds">';
+  html+='<button type="button" class="chip'+(catKind==='*'?' on':'')+'" data-k="*">All '+(catalog||[]).length+'</button>';
+  html+='<button type="button" class="chip'+(catKind==='lights'?' on':'')+'" data-k="lights">Lighthouses '+nTowers+'</button>';
+  html+='<button type="button" class="chip'+(catKind==='marks'?' on':'')+'" data-k="marks">Lights '+nMarks+'</button>';
+  html+='<button type="button" class="chip'+(catKind==='buoys'?' on':'')+'" data-k="buoys">Buoys '+nBuoys+'</button>';
+  html+='</div><div id="catChips">';
+  html+='<button type="button" class="chip'+(catShore==='*'?' on':'')+'" data-r="*">All '+pool.length+'</button>';
+  SHORES.forEach(function(s){
+   var n=pool.filter(function(e){return e.region===s[1];}).length;
+   if(!n) return;
+   html+='<button type="button" class="chip'+(catShore===s[1]?' on':'')+'" data-r="'+s[1]+'">'+s[0]+' '+n+'</button>';
+  });
+  html+='</div><label>Search</label><input id="catQ" value="'+esc(catQuery)+'" placeholder="Grand Haven, St. Joseph, Point Betsie">';
+  if(!show){
+   html+='<p class="note">Pick Lighthouses, Lights, or Buoys, then a shore — or search. Named towers are Lighthouses; numbered marks and marinas are Lights.</p>';
+  }else{
+   html+='<p class="note">'+hits.length+(catShore&&catShore!=='*'?' on this shore':' of '+pool.length)+'</p><div id="catList">';
+   hits.forEach(function(e,idx){
+    var used=onMap(e);
+    var ch=charOf(e);
+    html+='<div class="hit'+(used?' onmap':'')+'" data-i="'+idx+'"><b>'+esc(e.name)+'</b><div class="amber">'+esc(ch)+' · '+esc(e.region||'')+(e.metar?' · '+esc(e.metar):'')+'</div><div class="muted">'+esc(ledHint(e))+'</div>';
+    html+=used?'<div class="muted">Already on this chart</div>':'<div class="muted">Tap to add</div>';
+    html+='</div>';
+   });
+   html+='</div>';
+  }
+  html+='<button type="button" onclick="closeModal()">Done</button>';
+  document.getElementById('modalBox').innerHTML=html;
+  var box=document.getElementById('modalBox');
+  box._hits=hits;
+  document.getElementById('catQ').oninput=function(){paint(this.value);};
+  document.getElementById('catKinds').onclick=function(ev){
+   var b=ev.target.closest('.chip'); if(!b) return;
+   var k=b.getAttribute('data-k');
+   catKind=(catKind===k)?null:k;
+   paint(document.getElementById('catQ').value);
+  };
+  document.getElementById('catChips').onclick=function(ev){
+   var b=ev.target.closest('.chip'); if(!b) return;
+   var r=b.getAttribute('data-r');
+   catShore=(catShore===r)?null:r;
+   paint(document.getElementById('catQ').value);
+  };
+  var list=document.getElementById('catList');
+  if(list) list.onclick=function(ev){
+   var row=ev.target.closest('.hit'); if(!row||row.className.indexOf('onmap')>=0) return;
+   addCatalog(box._hits[parseInt(row.getAttribute('data-i'),10)]);
+  };
+ }
+ if(catalog){paint(catQuery); return;}
+ getJson('/catalog',function(data){
+  catalog=items(data);
+  if(!catalog.length){document.getElementById('modalBox').innerHTML='<h2>Catalog</h2><p class="note">Copy catalog.json to the chart (same folder as main.py), then reload.</p><button type="button" onclick="closeModal()">Close</button>'; return;}
+  paint('');
+ }, function(){document.getElementById('modalBox').innerHTML='<h2>Catalog</h2><p class="note">Copy catalog.json to the chart, then reload this page.</p><button type="button" onclick="closeModal()">Close</button>';});
+}
+function addCatalog(e){
+ if(!e||onMap(e)) return;
+ var row={id:e.id,name:e.name,short_name:e.short_name||e.name,led:lights.length,lat:e.lat||0,lon:e.lon||0,metar:e.metar||'',metar_fallback:e.metar_fallback||'',metar_name:e.metar_name||'',water:e.region||'',active:true,skip:false,light:e.light||{char:'F W',color:'W',period_s:1,on_s:[1],off_s:[0]}};
+ if(e.light_b) row.light_b=e.light_b;
+ if(e.pair) row.pair=e.pair;
+ lights.push(row);
+ render(); say('Added '+e.name); openCatalog();
+}
+function openCustom(){
+ var opts=PRESETS.map(function(p,i){return '<option value="'+i+'">'+esc(p.label)+'</option>';}).join('');
+ document.getElementById('modalBox').innerHTML='<h2>Add lighthouse</h2><label>Name</label><input id="cName"><label>Characteristic</label><select id="cPreset">'+opts+'</select><label>Nearby METAR (optional)</label><input id="cMetar" maxlength="4" placeholder="KSUE, KMTW, K3D2"><div class="actions"><button type="button" onclick="addCustom()">Add</button><button type="button" class="tiny" onclick="closeModal()">Cancel</button></div>';
+ document.getElementById('overlay').style.display='block';
+ document.getElementById('overlay').style.pointerEvents='auto';
+}
+function addCustom(){
+ var name=(document.getElementById('cName').value||'').trim();
+ if(!name) return;
+ var p=PRESETS[parseInt(document.getElementById('cPreset').value,10)]||PRESETS[0];
+ var metar=(document.getElementById('cMetar').value||'').trim().toUpperCase();
+ lights.push({id:slug(name)+'_'+Date.now()%100000,name:name,short_name:name,led:lights.length,metar:metar,metar_fallback:metar,active:true,skip:false,light:{char:p.char,color:p.color,period_s:p.period_s,on_s:p.on_s.slice(),off_s:p.off_s.slice()}});
+ render(); say('Added '+name); closeModal();
+}
+function closeModal(){
+ var el=document.getElementById('overlay');
+ el.style.display='none';
+ el.style.pointerEvents='none';
+}
+if(!Array.isArray(lights)) lights=[];
+try{
+ showTab('__TAB__');
+ loadLights();
+}catch(e){say('Page error: '+e);}
+</script>
+</body></html>

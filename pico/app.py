@@ -438,6 +438,160 @@ def _remember_wifi(cfg):
             _wifi_password = ""
 
 
+def _config_public():
+    """Settings JSON without importing wifi_manager.
+
+    That module is the setup page. Loading it while the chart is running
+    fails with an out-of-memory error, so the app never receives led_pin.
+    """
+    out = {
+        "ok": True,
+        "ssid": _wifi_ssid or "",
+        "num_leds": NUM_LEDS,
+        "led_pin": LED_PIN,
+        "display_type": DISPLAY_TYPE,
+        "matrix_scroll": MATRIX_SCROLL,
+        "matrix_scroll_speed": MATRIX_SCROLL_SPEED,
+        "scroll_times": SCROLL_TIMES,
+        "light_show": LIGHT_SHOW,
+        "tour_flash_s": int(TOUR_NORMAL_MS / 1000),
+        "tour_step_s": int(TOUR_STEP_MS / 1000),
+        "brightness": BRIGHTNESS,
+        "min_brightness": MIN_BRIGHTNESS,
+        "max_brightness": MAX_BRIGHTNESS,
+        "beacon_pulse": bool(BEACON_PULSE),
+        "cycle_delay": CYCLE_DELAY,
+        "version": FIRMWARE_VERSION,
+        "name": "GreatLakesLighthouses",
+        "update_available": bool(update_available),
+        "update_version": (update_info or {}).get("version", "") if update_available else "",
+    }
+    for key in sleep_cfg:
+        out[key] = sleep_cfg[key]
+    return out
+
+
+def _read_saved_config():
+    try:
+        with open(CONFIG_FILE, "r") as f:
+            cfg = json.load(f)
+        if isinstance(cfg, dict):
+            return cfg
+    except Exception:
+        pass
+    return {}
+
+
+def _as_bool(v):
+    return str(v).lower() in ("1", "on", "true", "yes")
+
+
+def _tz_name(raw, offset):
+    s = str(raw or "").strip().lower().replace(" ", "_")
+    if s in ("central", "america/chicago", "cst", "cdt", "chicago"):
+        return "central"
+    if s in ("eastern", "america/new_york", "est", "edt", "new_york"):
+        return "eastern"
+    try:
+        off = int(float(offset))
+    except Exception:
+        off = -6
+    if off == -4:
+        return "eastern"
+    return "central"
+
+
+def _days_from_civil(y, m, d):
+    y = int(y)
+    m = int(m)
+    d = int(d)
+    y -= 1 if m <= 2 else 0
+    era = y // 400
+    yoe = y - era * 400
+    doy = (153 * (m + (-3 if m > 2 else 9)) + 2) // 5 + d - 1
+    doe = yoe * 365 + yoe // 4 - yoe // 100 + doy
+    return era * 146097 + doe - 719468
+
+
+def _tz_offset(zid):
+    std, dst = ((-5, -4) if zid == "eastern" else (-6, -5))
+    try:
+        utc = int(time.time())
+        y = time.gmtime(utc)[0]
+        def sunday(month, n):
+            w = (_days_from_civil(y, month, 1) + 3) % 7
+            return 1 + (6 - w) % 7 + (int(n) - 1) * 7
+        def unix(month, day, hour):
+            return _days_from_civil(y, month, day) * 86400 + int(hour) * 3600
+        start = unix(3, sunday(3, 2), 2 - std)
+        end = unix(11, sunday(11, 1), 2 - dst)
+        if start <= utc < end:
+            return dst
+    except Exception:
+        pass
+    return std
+
+
+def _apply_config_fields(src):
+    cfg = _read_saved_config()
+    if src.get("ssid"):
+        cfg["ssid"] = str(src["ssid"])
+    if src.get("password") is not None and str(src.get("password")) != "":
+        cfg["password"] = str(src["password"])
+    if "num_leds" in src and str(src["num_leds"]) != "":
+        cfg["num_leds"] = _clamp(int(src["num_leds"]), 1, 300)
+    if "led_pin" in src and str(src["led_pin"]) != "":
+        cfg["led_pin"] = _safe_gpio(src["led_pin"], cfg.get("led_pin", LED_PIN))
+    if "display_type" in src and str(src["display_type"]) != "":
+        kind = str(src["display_type"]).strip().upper()
+        cfg["display_type"] = kind if kind in ("NONE", "OLED", "LED_MATRIX", "BOTH") else DISPLAY_TYPE
+    if "matrix_scroll" in src and str(src["matrix_scroll"]) != "":
+        scroll = str(src["matrix_scroll"]).strip().upper()
+        cfg["matrix_scroll"] = scroll if scroll in ("WEATHER", "ALL") else "WEATHER"
+    if "light_show" in src and str(src["light_show"]) != "":
+        show = str(src["light_show"]).strip().upper()
+        cfg["light_show"] = show if show in ("FLASH", "TOUR") else "TOUR"
+    if "min_brightness" in src and str(src["min_brightness"]) != "":
+        cfg["min_brightness"] = _clamp(int(float(src["min_brightness"])), 0, BRIGHTNESS_CAP)
+    if "max_brightness" in src and str(src["max_brightness"]) != "":
+        cfg["max_brightness"] = _clamp(int(float(src["max_brightness"])), 1, BRIGHTNESS_CAP)
+        cfg["brightness"] = max(0.02, min(1.0, cfg["max_brightness"] / 255.0))
+    elif "brightness" in src and str(src["brightness"]) != "":
+        cfg["brightness"] = max(0.02, min(1.0, float(src["brightness"])))
+        cfg["max_brightness"] = _clamp(int(round(cfg["brightness"] * 255)), 1, BRIGHTNESS_CAP)
+    if "beacon_pulse" in src:
+        cfg["beacon_pulse"] = _as_bool(src["beacon_pulse"])
+    if "sleep_enabled" in src:
+        cfg["sleep_enabled"] = _as_bool(src["sleep_enabled"])
+    if "weekend_mode_enabled" in src:
+        cfg["weekend_mode_enabled"] = _as_bool(src["weekend_mode_enabled"])
+    for key, lo, hi in (
+        ("sleep_at_hour", 0, 23),
+        ("sleep_at_minute", 0, 59),
+        ("wake_at_hour", 0, 23),
+        ("wake_at_minute", 0, 59),
+        ("cycle_delay", 30, 3600),
+        ("tour_flash_s", 10, 1800),
+        ("tour_step_s", 2, 120),
+        ("matrix_scroll_speed", 1, 10),
+        ("scroll_times", 1, 10),
+        ("weekend_off_weekday", 0, 6),
+        ("weekend_off_hour", 0, 23),
+        ("weekend_off_minute", 0, 59),
+        ("weekend_on_weekday", 0, 6),
+        ("weekend_on_hour", 0, 23),
+        ("weekend_on_minute", 0, 59),
+    ):
+        if key in src and str(src[key]) != "":
+            cfg[key] = _clamp(int(float(src[key])), lo, hi)
+    zid = _tz_name(src.get("timezone") or cfg.get("timezone"), src.get("timezone_offset_hours", cfg.get("timezone_offset_hours", -6)))
+    cfg["timezone"] = zid
+    cfg["timezone_offset_hours"] = _tz_offset(zid)
+    with open(CONFIG_FILE, "w") as f:
+        json.dump(cfg, f)
+    return cfg
+
+
 def connect_wifi(cfg):
     global wlan, _wifi_was_up
     _remember_wifi(cfg)
@@ -1487,12 +1641,34 @@ def lighthouse_payload():
     return list(lighthouses)
 
 
+def _save_lighthouse_list(items):
+    cleaned = []
+    for i, raw in enumerate(items):
+        if isinstance(raw, dict):
+            entry = dict(raw)
+            entry["led"] = i
+            cleaned.append(entry)
+    payload = {"version": 3, "order": "list", "lighthouses": cleaned}
+    tmp = "lighthouses_tmp.json"
+    with open(tmp, "w") as f:
+        json.dump(payload, f)
+    try:
+        try:
+            os.remove("lighthouses.json")
+        except Exception:
+            pass
+        os.rename(tmp, "lighthouses.json")
+    except Exception:
+        with open("lighthouses.json", "w") as f:
+            json.dump(payload, f)
+    return cleaned
+
+
 def apply_lighthouse_list(items):
     global lighthouses, NUM_LEDS
     if not isinstance(items, list):
         return 0
-    import wifi_manager
-    cleaned = wifi_manager.save_lighthouse_list(items)
+    cleaned = _save_lighthouse_list(items)
     lighthouses = cleaned
     n = max(1, len(cleaned))
     if n != NUM_LEDS:
@@ -1540,7 +1716,49 @@ def read_http(conn):
         return "", ""
 
 
+_send_scratch = bytearray(128)
+
+
+def _write_conn(conn, data):
+    """Copy 128 bytes at a time. Sending a slice of the whole reply asks for another 7 KB."""
+    if isinstance(data, str):
+        data = data.encode()
+    mv = memoryview(data)
+    try:
+        conn.setblocking(False)
+    except Exception:
+        pass
+    deadline = time.ticks_add(time.ticks_ms(), 8000)
+    while len(mv):
+        if time.ticks_diff(deadline, time.ticks_ms()) < 0:
+            return False
+        n = 128 if len(mv) > 128 else len(mv)
+        _send_scratch[:n] = mv[:n]
+        try:
+            sent = conn.send(bytes(_send_scratch[:n]))
+        except OSError:
+            time.sleep_ms(2)
+            continue
+        if not sent:
+            time.sleep_ms(2)
+            continue
+        mv = mv[sent:]
+        deadline = time.ticks_add(time.ticks_ms(), 8000)
+    return True
+
+
+def _close_conn(conn):
+    try:
+        conn.close()
+    except Exception:
+        pass
+
+
+_resp_started = False
+
+
 def _http_send(conn, content_type, body, status="200 OK"):
+    global _resp_started
     if isinstance(body, str):
         body = body.encode()
     hdr = (
@@ -1548,12 +1766,222 @@ def _http_send(conn, content_type, body, status="200 OK"):
         "Connection: close\r\nAccess-Control-Allow-Origin: *\r\n\r\n"
         % (status, content_type, len(body))
     )
-    data = hdr.encode() + body
-    while data:
-        sent = conn.send(data)
-        if not sent:
-            break
-        data = data[sent:]
+    if _write_conn(conn, hdr):
+        _resp_started = True
+        _write_conn(conn, body)
+
+
+def _send_file(conn, path, content_type, missing):
+    try:
+        size = os.stat(path)[6]
+    except Exception:
+        _http_send(conn, content_type, missing)
+        return
+    hdr = (
+        "HTTP/1.1 200 OK\r\nContent-Type: %s\r\nContent-Length: %d\r\n"
+        "Connection: close\r\nAccess-Control-Allow-Origin: *\r\n\r\n"
+        % (content_type, size)
+    )
+    if not _write_conn(conn, hdr):
+        return
+    try:
+        with open(path, "rb") as f:
+            while True:
+                chunk = f.read(512)
+                if not chunk:
+                    break
+                if not _write_conn(conn, chunk):
+                    break
+    except Exception as e:
+        print("HTTP file", path, e)
+
+
+def _html_attr(value):
+    s = str(value)
+    return s.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;").replace('"', "&quot;")
+
+
+def _select_opts(pairs, selected):
+    parts = []
+    sel = str(selected)
+    for value, label in pairs:
+        mark = " selected" if str(value) == sel else ""
+        parts.append('<option value="%s"%s>%s</option>' % (value, mark, label))
+    return "".join(parts)
+
+
+def _gpio_opts(selected):
+    notes = {
+        3: "setup button (D1)",
+        4: "LDR input (D2)",
+        5: "LED matrix (D3)",
+        6: "OLED SDA (D4)",
+        7: "OLED SCL (D5)",
+        8: "strip data (D8)",
+        10: "free (D10)",
+        20: "free (D7)",
+        21: "LDR 3.3 V (D6)",
+    }
+    parts = []
+    for n in SAFE_GPIO:
+        mark = " selected" if n == selected else ""
+        note = notes.get(n)
+        label = ("GPIO %d — %s" % (n, note)) if note else ("GPIO %d" % n)
+        parts.append('<option value="%d"%s>%s</option>' % (n, mark, label))
+    return "".join(parts)
+
+
+def _page_subs():
+    cfg = _config_public()
+    tz = cfg.get("timezone") or "central"
+    if update_available:
+        ver = (" v" + str((update_info or {}).get("version", ""))) if update_info else ""
+        banner = (
+            '<p class="card" style="background:#E8A838;color:#0B1F3A">'
+            "<strong>Update available%s</strong><br>"
+            "This chart is still on %s. Install below, or press the setup button once.</p>"
+        ) % (_html_attr(ver), _html_attr(cfg.get("version") or ""))
+    else:
+        banner = (
+            '<p class="note">No update waiting. This chart matches GitHub, '
+            "or the chart is not on home Wi-Fi yet.</p>"
+        )
+    checked = "checked"
+    return {
+        "__SSID__": _html_attr(cfg.get("ssid") or ""),
+        "__NUM_LEDS__": _html_attr(cfg.get("num_leds", NUM_LEDS)),
+        "__GPIO_OPTS__": _gpio_opts(cfg.get("led_pin", LED_PIN)),
+        "__DISPLAY_OPTS__": _select_opts(
+            (("BOTH", "OLED and LED matrix"), ("OLED", "OLED (128x64)"), ("LED_MATRIX", "LED matrix (8x32)"), ("NONE", "LED strip only")),
+            cfg.get("display_type") or "NONE",
+        ),
+        "__SHOW_OPTS__": _select_opts((("FLASH", "Keep flashing"), ("TOUR", "Populate one by one")), cfg.get("light_show") or "TOUR"),
+        "__TOUR_FLASH__": _html_attr(cfg.get("tour_flash_s", 180)),
+        "__TOUR_STEP__": _html_attr(cfg.get("tour_step_s", 10)),
+        "__SCROLL_OPTS__": _select_opts((("WEATHER", "Weather only"), ("ALL", "All lights")), cfg.get("matrix_scroll") or "WEATHER"),
+        "__SCROLL_SPD__": _html_attr(cfg.get("matrix_scroll_speed", 7)),
+        "__SCROLL_TIMES__": _html_attr(cfg.get("scroll_times", 1)),
+        "__MINB__": _html_attr(cfg.get("min_brightness", 0)),
+        "__MAXB__": _html_attr(cfg.get("max_brightness", 18)),
+        "__CYCLE__": _html_attr(cfg.get("cycle_delay", 300)),
+        "__BEACON__": checked if cfg.get("beacon_pulse", True) else "",
+        "__TZ_OPTS__": _select_opts((("central", "Central — Chicago (DST automatic)"), ("eastern", "Eastern — New York (DST automatic)")), tz),
+        "__SLEEP__": checked if cfg.get("sleep_enabled") else "",
+        "__SH__": _html_attr(cfg.get("sleep_at_hour", 22)),
+        "__SM__": _html_attr(cfg.get("sleep_at_minute", 0)),
+        "__WH__": _html_attr(cfg.get("wake_at_hour", 6)),
+        "__WM__": _html_attr(cfg.get("wake_at_minute", 0)),
+        "__WEEKEND__": checked if cfg.get("weekend_mode_enabled") else "",
+        "__WDOFF__": _select_opts(tuple((str(i), n) for i, n in enumerate(("Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday", "Sunday"))), cfg.get("weekend_off_weekday", 4)),
+        "__WOH__": _html_attr(cfg.get("weekend_off_hour", 18)),
+        "__WOM__": _html_attr(cfg.get("weekend_off_minute", 0)),
+        "__WDON__": _select_opts(tuple((str(i), n) for i, n in enumerate(("Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday", "Sunday"))), cfg.get("weekend_on_weekday", 0)),
+        "__WIH__": _html_attr(cfg.get("weekend_on_hour", 6)),
+        "__WIM__": _html_attr(cfg.get("weekend_on_minute", 0)),
+        "__TAB__": "settings" if not cfg.get("ssid") else "lights",
+        "__FW_VER__": _html_attr(cfg.get("version") or FIRMWARE_VERSION),
+        "__UPDATE_BANNER__": banner,
+    }
+
+
+def _fill_ready(text, subs, keep):
+    """Replace tokens that are complete, and keep a tail so one is not split."""
+    if len(text) <= keep:
+        return "", text
+    cut = len(text) - keep
+    moved = True
+    while moved and cut > 0:
+        moved = False
+        for key in subs:
+            n = len(key)
+            for i in range(1, n):
+                if cut >= i and text[cut - i:cut] == key[:i]:
+                    rest = text[cut:cut - i + n]
+                    if rest == key[i:i + len(rest)]:
+                        cut -= i
+                        moved = True
+                        break
+            if moved:
+                break
+    head = text[:cut]
+    for key in subs:
+        if key in head:
+            head = head.replace(key, subs[key])
+    return head, text[cut:]
+
+
+def _send_setup_page(conn):
+    subs = _page_subs()
+    try:
+        f = open("setup.html", "r")
+    except Exception:
+        _http_send(conn, "text/html; charset=utf-8", "<p>Copy setup.html to the chart, then reload.</p>")
+        return
+    hdr = (
+        "HTTP/1.0 200 OK\r\nContent-Type: text/html; charset=utf-8\r\n"
+        "Connection: close\r\nAccess-Control-Allow-Origin: *\r\n\r\n"
+    )
+    if not _write_conn(conn, hdr):
+        f.close()
+        return
+    pending = ""
+    try:
+        while True:
+            chunk = f.read(200)
+            if not chunk:
+                break
+            pending += chunk
+            head, pending = _fill_ready(pending, subs, 24)
+            if head and not _write_conn(conn, head):
+                return
+        if pending:
+            for key in subs:
+                if key in pending:
+                    pending = pending.replace(key, subs[key])
+            _write_conn(conn, pending)
+    finally:
+        f.close()
+
+
+def _parse_form(body):
+    params = {}
+    if not body:
+        return params
+    text = body.decode() if isinstance(body, (bytes, bytearray)) else str(body)
+    for pair in text.split("&"):
+        if "=" not in pair:
+            continue
+        k, v = pair.split("=", 1)
+        params[_urldecode(k)] = _urldecode(v)
+    return params
+
+
+def _urldecode(s):
+    s = str(s).replace("+", " ")
+    out = []
+    i = 0
+    while i < len(s):
+        if s[i] == "%" and i + 2 < len(s):
+            try:
+                out.append(chr(int(s[i + 1:i + 3], 16)))
+                i += 3
+                continue
+            except Exception:
+                pass
+        out.append(s[i])
+        i += 1
+    return "".join(out)
+
+
+def _saved_page(ip):
+    ip_line = ("LAN IP: <b>%s</b>." % ip) if ip else "The chart will reconnect after it reboots."
+    return (
+        "<!DOCTYPE html><html><head><meta charset=\"utf-8\">"
+        "<meta name=\"viewport\" content=\"width=device-width,initial-scale=1\"><title>Saved</title></head>"
+        "<body style=\"font-family:Arial;background:#0B1F3A;color:#F4EBD0;padding:24px\">"
+        "<h1 style=\"color:#E8A838\">Saved</h1><p>%s</p>"
+        "<p>Reconnect to home Wi-Fi after the chart reboots.</p></body></html>"
+    ) % ip_line
 
 
 def _handle_start_update(conn):
@@ -1724,7 +2152,8 @@ def handle_http():
 
 
 def _handle_conn(conn):
-    global _matrix_need_text
+    global _matrix_need_text, _resp_started
+    _resp_started = False
     try:
         header, req_body = read_http(conn)
         line = header.split("\r\n", 1)[0] if header else ""
@@ -1732,22 +2161,13 @@ def _handle_conn(conn):
         query = _request_query(line)
         method = line.split(" ", 1)[0] if line else "GET"
         if method == "OPTIONS":
-            import wifi_manager
-            wifi_manager.send_options(conn)
+            _http_send(conn, "text/plain", "", "204 No Content")
         elif method == "GET" and path == "/help":
-            import wifi_manager
-            wifi_manager.send_static_file(
-                conn,
-                "help.html",
-                "text/html; charset=utf-8",
-                "<p>Copy help.html to the chart, then reload.</p>",
-            )
+            _send_file(conn, "help.html", "text/html; charset=utf-8", "<p>Copy help.html to the chart, then reload.</p>")
         elif method == "GET" and path == "/catalog":
-            import wifi_manager
-            wifi_manager.send_json_file(conn, "catalog.json", {"ok": False, "lighthouses": []})
+            _send_file(conn, "catalog.json", "application/json", "{\"ok\":false,\"lighthouses\":[]}")
         elif method == "GET" and path == "/lighthouses-defaults":
-            import wifi_manager
-            wifi_manager.send_json_file(conn, "lighthouses_defaults.json", {"ok": False, "lighthouses": []})
+            _send_file(conn, "lighthouses_defaults.json", "application/json", "{\"ok\":false,\"lighthouses\":[]}")
         elif path == "/identify":
             led = None
             hold = 8000
@@ -1771,14 +2191,14 @@ def _handle_conn(conn):
                 ms = start_identify(int(led), hold)
                 _http_send(conn, "application/json", json.dumps({"ok": True, "identifying": True, "led": int(led), "ms": ms}))
         elif method == "GET" and path == "/lighthouses":
-            _http_send(conn, "application/json", json.dumps({"ok": True, "lighthouses": lighthouse_payload(), "num_leds": NUM_LEDS}))
+            # The built JSON is about 7 KB and a second copy of it fails on this chip.
+            _send_file(conn, "lighthouses.json", "application/json", "{\"ok\":false,\"lighthouses\":[]}")
         elif method == "POST" and path == "/lighthouses":
             try:
-                import wifi_manager
                 if req_body and req_body.lstrip()[:1] == "{":
                     payload = json.loads(req_body)
                 else:
-                    payload = wifi_manager.parse_body("\r\n\r\n" + (req_body or ""))
+                    payload = _parse_form(req_body)
                 items = payload.get("lighthouses") if isinstance(payload, dict) else payload
                 if isinstance(items, str):
                     items = json.loads(items)
@@ -1786,8 +2206,7 @@ def _handle_conn(conn):
                 if req_body and req_body.lstrip()[:1] == "{":
                     _http_send(conn, "application/json", json.dumps({"ok": True, "count": count, "num_leds": NUM_LEDS, "message": "saved"}))
                 else:
-                    import wifi_manager
-                    _http_send(conn, "text/html; charset=utf-8", wifi_manager.setup_page(update_available, (update_info or {}).get("version", ""), FIRMWARE_VERSION))
+                    _send_setup_page(conn)
             except Exception as e:
                 _http_send(conn, "application/json", json.dumps({"ok": False, "message": str(e)}))
         elif method == "GET" and path == "/status":
@@ -1804,26 +2223,16 @@ def _handle_conn(conn):
                 "update_version": (update_info or {}).get("version", "") if update_available else "",
             }))
         elif method == "GET" and path == "/config":
-            import wifi_manager
-            out = wifi_manager.merge_defaults(load_config())
-            out.pop("password", None)
-            out["ok"] = True
-            out["version"] = FIRMWARE_VERSION
-            out["name"] = "GreatLakesLighthouses"
-            out["update_available"] = update_available
-            if update_info:
-                out["update_version"] = update_info.get("version", "")
-            _http_send(conn, "application/json", json.dumps(out))
+            _http_send(conn, "application/json", json.dumps(_config_public()))
         elif method == "POST" and path == "/start-update":
             _handle_start_update(conn)
         elif method == "POST" and path in ("/update-config", "/configure"):
-            import wifi_manager
             is_json = bool(req_body) and req_body.lstrip()[:1] == "{"
             try:
                 if is_json:
                     payload = json.loads(req_body) if req_body else {}
                 else:
-                    payload = wifi_manager.parse_body("\r\n\r\n" + (req_body or ""))
+                    payload = _parse_form(req_body)
                     if "beacon_pulse" not in payload:
                         payload["beacon_pulse"] = False
                     if "sleep_enabled" not in payload:
@@ -1833,9 +2242,7 @@ def _handle_conn(conn):
                 if not isinstance(payload, dict):
                     raise ValueError("object required")
                 old_pin = LED_PIN
-                cfg = wifi_manager.merge_defaults(load_config())
-                wifi_manager.apply_fields(cfg, payload)
-                wifi_manager.save_config(cfg)
+                _apply_config_fields(payload)
                 load_config()
                 _matrix_need_text = True
                 if LED_PIN != old_pin:
@@ -1844,7 +2251,7 @@ def _handle_conn(conn):
                 if is_json:
                     _http_send(conn, "application/json", json.dumps({"ok": True, "message": "saved", "version": FIRMWARE_VERSION}))
                 else:
-                    _http_send(conn, "text/html; charset=utf-8", wifi_manager.success_page(True, status.get("ip")))
+                    _http_send(conn, "text/html; charset=utf-8", _saved_page(status.get("ip")))
                 if reboot:
                     conn.close()
                     time.sleep(1)
@@ -1862,22 +2269,19 @@ def _handle_conn(conn):
             machine.reset()
             return
         elif method == "GET" and path in ("/", "/index.html"):
-            import wifi_manager
-            _http_send(conn, "text/html; charset=utf-8", wifi_manager.setup_page(update_available, (update_info or {}).get("version", ""), FIRMWARE_VERSION))
+            _send_setup_page(conn)
         elif method == "GET" and path == "/favicon.ico":
             _http_send(conn, "text/plain", "")
         else:
             _http_send(conn, "application/json", json.dumps({"ok": True, "see": ["/status", "/lighthouses", "/catalog", "/config"]}))
     except Exception as e:
         print("HTTP", e)
-        try:
-            _http_send(conn, "text/plain", "HTTP error: %s" % e)
-        except Exception:
-            pass
-    try:
-        conn.close()
-    except Exception:
-        pass
+        if not _resp_started:
+            try:
+                _http_send(conn, "text/plain", "HTTP error: %s" % e)
+            except Exception:
+                pass
+    _close_conn(conn)
 
 
 oled = None

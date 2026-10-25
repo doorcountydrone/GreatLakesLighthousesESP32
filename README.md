@@ -58,6 +58,7 @@ Do not use D9, or any GPIO from 12 through 19. Those are strap, flash, or USB pi
    - `pico/lighthouses_defaults.json`
    - `pico/catalog.json`
    - `pico/help.html`
+   - `pico/setup.html`
    Rebuild the `.mpy` files from the matching `.py` sources with `mpy-cross -march=rv32imc -msmall-int-bits=31` after editing them. Do not also copy those `.py` files onto the board.
 3. Power the board. On first boot it opens **GreatLakes-Setup** (password `door1234`). The OLED shows the firmware version while setup is running.
 4. Join that network on your phone and open **http://192.168.4.1**.

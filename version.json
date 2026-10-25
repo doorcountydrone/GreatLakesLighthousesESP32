@@ -49,6 +49,10 @@
     {
       "name": "help.html",
       "url": "https://raw.githubusercontent.com/doorcountydrone/GreatLakesLighthousesESP32/main/pico/help.html"
+    },
+    {
+      "name": "setup.html",
+      "url": "https://raw.githubusercontent.com/doorcountydrone/GreatLakesLighthousesESP32/main/pico/setup.html"
     }
   ]
 }
