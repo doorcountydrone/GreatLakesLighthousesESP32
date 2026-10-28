@@ -1476,7 +1476,7 @@ def run_server(force_ap=False):
             if first.startswith("OPTIONS"):
                 send_options(conn)
             elif first.startswith("GET /status"):
-                st = {"ok": True, "mode": "setup", "name": "GreatLakesLighthouses", "num_leds": int(num_leds)}
+                st = {"ok": True, "mode": "setup", "name": "GreatLakesLighthouses", "board": "xiao-esp32c3", "num_leds": int(num_leds)}
                 try:
                     import sys
                     ver = getattr(sys.modules.get("__main__"), "FIRMWARE_VERSION", None)
@@ -1528,6 +1528,7 @@ def run_server(force_ap=False):
                 out = merge_defaults(load_config())
                 out.pop("password", None)
                 out["ok"] = True
+                out["board"] = "xiao-esp32c3"
                 out["update_available"] = False
                 try:
                     import sys

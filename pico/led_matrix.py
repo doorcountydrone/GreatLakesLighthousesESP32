@@ -1,5 +1,6 @@
 # 8x32 WS2812 matrix on XIAO ESP32C3 D3 / GPIO 5 (snake-column wiring).
-# Scrolls one column at a time from the main loop so the lighthouse strip keeps flashing.
+# Speeds 1-7 move one column and only the wait changes. Speeds 8-10 move a
+# little farther, and never more than two columns.
 
 import machine
 import neopixel
@@ -10,7 +11,14 @@ HEIGHT = 8
 PIN = 5
 NUM_LEDS = WIDTH * HEIGHT
 SCROLL_MS = 70
+_scroll_base = SCROLL_MS
 _scroll_ms = SCROLL_MS
+_step_num = 1
+_step_den = 1
+_step_live_num = 1
+_step_live_den = 1
+_step_acc = 0
+_pace_sig = None
 # SNAKE_COLUMN: even columns top->bottom, odd columns bottom->top.
 WIRING = "SNAKE_COLUMN"
 
@@ -188,12 +196,53 @@ def set_text(text, color=(255, 180, 48)):
     set_segments([(text, color)])
 
 
-def set_scroll_ms(ms):
-    global _scroll_ms
+def set_scroll_ms(ms, step_num=1, step_den=1):
+    """Store the slider pace. Zero ms means move on every frame."""
+    global _scroll_base, _step_num, _step_den
     try:
-        _scroll_ms = max(20, min(250, int(ms)))
+        base = int(ms)
     except Exception:
-        _scroll_ms = SCROLL_MS
+        base = SCROLL_MS
+    if base < 0:
+        base = 0
+    elif base > 400:
+        base = 400
+    try:
+        num = int(step_num)
+        den = int(step_den)
+    except Exception:
+        num = 1
+        den = 1
+    if num < 1:
+        num = 1
+    if den < 1:
+        den = 1
+    if num > den * 2:
+        num = den * 2
+    _scroll_base = base
+    _step_num = num
+    _step_den = den
+    _apply_length_speed()
+
+
+def _apply_length_speed():
+    """The slider wait is the pace. The same speed stays smooth on a long line."""
+    global _scroll_ms, _step_live_num, _step_live_den, _pace_sig
+    ms = _scroll_base
+    if ms < 0:
+        ms = 0
+    if ms > 400:
+        ms = 400
+    num = _step_num
+    den = _step_den
+    real = len(_columns) - WIDTH
+    sig = (ms, num, den)
+    if sig != _pace_sig and _columns:
+        _pace_sig = sig
+        print("Matrix pace", real, "cols", ms, "ms", "step", num, "/", den)
+    _scroll_ms = ms
+    _step_live_num = num
+    _step_live_den = den
 
 
 def set_scroll_times(n):
@@ -205,7 +254,7 @@ def set_scroll_times(n):
 
 
 def set_segments(segments):
-    global _columns, _col_colors, _offset, _pass, _color, _text
+    global _columns, _col_colors, _offset, _pass, _color, _text, _step_acc
     parts = []
     for text, color in segments or []:
         t = str(text or "").strip()
@@ -217,7 +266,9 @@ def set_segments(segments):
         _col_colors = []
         _offset = 0
         _pass = 0
+        _step_acc = 0
         clear()
+        _apply_length_speed()
         return
     key = "|".join(p[0] + str(p[1]) for p in parts)
     if key == _text and _columns:
@@ -247,12 +298,30 @@ def set_segments(segments):
     _color = parts[0][1]
     _offset = 0
     _pass = 0
+    _step_acc = 0
+    _apply_length_speed()
+
+
+_blank = None
+
+
+def _clear_pixels():
+    """Clear the LED buffer in one copy. NeoPixel.fill walks every pixel in Python."""
+    global _blank
+    buf = getattr(_np, "buf", None)
+    if not buf:
+        _np.fill((0, 0, 0))
+        return
+    n = len(buf)
+    if _blank is None or len(_blank) != n:
+        _blank = bytes(n)
+    buf[:] = _blank
 
 
 def clear():
     if _np is None:
         return
-    _np.fill((0, 0, 0))
+    _clear_pixels()
     _np.write()
 
 
@@ -267,7 +336,7 @@ def tick(level=8, sleeping=False):
         return False
     _sleep_cleared = False
     now = time.ticks_ms()
-    if _last_ms and time.ticks_diff(now, _last_ms) < _scroll_ms:
+    if _last_ms and _scroll_ms and time.ticks_diff(now, _last_ms) < _scroll_ms:
         return False
     _last_ms = now
     if not _columns:
@@ -275,17 +344,10 @@ def tick(level=8, sleeping=False):
     n = len(_columns)
     span = max(1, n - WIDTH)
     scale = max(0, min(255, int(level)))
-    _np.fill((0, 0, 0))
+    _clear_pixels()
     if scale <= 0:
         _np.write()
-        _offset += 1
-        if _offset >= span:
-            _offset = 0
-            _pass += 1
-            if _pass >= _scroll_times:
-                _pass = 0
-                return True
-        return False
+        return _advance(span)
     for x in range(WIDTH):
         idx = _offset + x
         if idx < 0 or idx >= n:
@@ -294,12 +356,34 @@ def tick(level=8, sleeping=False):
         if not bits:
             continue
         rgb = _col_colors[idx] if idx < len(_col_colors) else _color
-        pix = (rgb[0] * scale // 255, rgb[1] * scale // 255, rgb[2] * scale // 255)
+        peak = rgb[0]
+        if rgb[1] > peak:
+            peak = rgb[1]
+        if rgb[2] > peak:
+            peak = rgb[2]
+        if peak <= 0:
+            continue
+        pix = (rgb[0] * scale // peak, rgb[1] * scale // peak, rgb[2] * scale // peak)
         for y in range(HEIGHT):
             if bits & (1 << y):
                 _np[_index[x][y]] = pix
     _np.write()
-    _offset += 1
+    return _advance(span)
+
+
+def _advance(span):
+    global _offset, _pass, _step_acc
+    den = _step_live_den if _step_live_den >= 1 else 1
+    _step_acc += _step_live_num if _step_live_num >= 1 else 1
+    step = _step_acc // den
+    _step_acc -= step * den
+    if step < 1:
+        step = 1
+        _step_acc = 0
+    elif step > 2:
+        step = 2
+        _step_acc = 0
+    _offset += step
     if _offset >= span:
         _offset = 0
         _pass += 1

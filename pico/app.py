@@ -37,7 +37,7 @@ sans18 = None
 writer = None
 sans20 = None
 
-FIRMWARE_VERSION = "0.6.51"
+FIRMWARE_VERSION = "0.6.52"
 CONFIG_FILE = "wifi_config.json"
 LIGHTHOUSE_FILE = "lighthouses.json"
 # Seeed XIAO ESP32C3 header. GPIO 9 is the boot strap (do not use).
@@ -69,6 +69,21 @@ TOUR_DARK_MS = 2000
 TOUR_STEP_MS = 10000
 MATRIX_IDLE_COLOR = (40, 200, 210)
 MATRIX_SCROLL_SPEED = 7
+# Milliseconds between columns, then how many columns to move, for speeds 1 through 10.
+# Speeds 1-7 move one column and only the wait changes. Speeds 8, 9, and 10
+# add a little at a time, and never more than two columns, so the step is even.
+_MATRIX_PACE = (
+    (280, 1, 1),
+    (230, 1, 1),
+    (190, 1, 1),
+    (160, 1, 1),
+    (135, 1, 1),
+    (115, 1, 1),
+    (0, 1, 1),
+    (0, 6, 5),
+    (0, 3, 2),
+    (0, 2, 1),
+)
 SCROLL_TIMES = 1
 BRIGHTNESS_CAP = 30
 DISPLAY_TYPE = "BOTH"
@@ -463,6 +478,7 @@ def _config_public():
         "cycle_delay": CYCLE_DELAY,
         "version": FIRMWARE_VERSION,
         "name": "GreatLakesLighthouses",
+        "board": "xiao-esp32c3",
         "update_available": bool(update_available),
         "update_version": (update_info or {}).get("version", "") if update_available else "",
     }
@@ -752,33 +768,429 @@ def wifi_keep():
     _wifi_begin_connect()
 
 
-def load_lighthouses():
-    global lighthouses
+# Compact light kept in RAM: led, skip, color, pulses, color_b, pulses_b, metar, fallback, label.
+# pulses is on/off milliseconds, three pairs. The full record stays in the JSON file.
+_LIGHT_MAX = 256
+_REC = 40
+_lights = bytearray(0)
+_labels = bytearray(0)
+_names = bytearray(0)
+_NAME_MAX = 80
+_stations = []
+_nlights = 0
+_pack_fill = False
+_COLOR_CH = " WRGYB"
+
+
+def _ensure_light_bufs():
+    global _lights, _labels
+    need = _LIGHT_MAX * _REC
+    if len(_lights) != need:
+        _lights = bytearray(need)
+    need = _LIGHT_MAX * 24
+    if len(_labels) != need:
+        _labels = bytearray(need)
+
+
+def _put_u16(off, val):
+    if val < 0:
+        val = 0
+    if val > 65535:
+        val = 65535
+    _lights[off] = val & 255
+    _lights[off + 1] = (val >> 8) & 255
+
+
+def _color_n(spec):
+    if not isinstance(spec, dict):
+        return 0
+    code = str(spec.get("color") or "W").strip().upper()[:1]
+    return {"W": 1, "R": 2, "G": 3, "Y": 4, "B": 5}.get(code, 1)
+
+
+def _sta_index(sid):
+    sid = _metar_id(sid)
+    if not sid:
+        return 0
+    if len(sid) > 8:
+        sid = sid[:8]
+    for i, got in enumerate(_stations):
+        if got == sid:
+            return i + 1
+    if len(_stations) >= 80:
+        return 0
+    _stations.append(sid)
+    return len(_stations)
+
+
+def _put_light(obj, index):
+    base = index * _REC
+    led = index
     try:
-        items = []
-        for name in ("lighthouses.json", "lighthouses_defaults.json"):
-            try:
-                with open(name, "r") as f:
-                    raw = f.read()
-            except Exception:
-                continue
-            if raw.startswith("\ufeff"):
-                raw = raw[1:]
-            if not raw.strip():
-                continue
-            data = json.loads(raw)
-            items = data.get("lighthouses", []) if isinstance(data, dict) else data
-            if isinstance(items, list) and items:
+        led = int(obj.get("led", index))
+    except Exception:
+        led = index
+    if led < 0:
+        led = 0
+    if led > 65535:
+        led = 65535
+    _put_u16(base, led)
+    _lights[base + 2] = 1 if obj.get("skip") else 0
+    spec = obj.get("light")
+    spec_b = obj.get("light_b")
+    if not isinstance(spec, dict):
+        extra = obj.get("lights")
+        if isinstance(extra, list) and extra:
+            spec = extra[0] if isinstance(extra[0], dict) else None
+            if not isinstance(spec_b, dict) and len(extra) > 1 and isinstance(extra[1], dict):
+                spec_b = extra[1]
+    _lights[base + 3] = _color_n(spec)
+    pulses = _pulses_from_spec(spec)
+    for k in range(6):
+        _put_u16(base + 4 + k * 2, pulses[k])
+    _lights[base + 16] = _color_n(spec_b) if isinstance(spec_b, dict) else 0
+    _lights[base + 17] = _sta_index(obj.get("metar", ""))
+    _lights[base + 18] = _sta_index(obj.get("metar_fallback", ""))
+    label = str(obj.get("short_name") or obj.get("name") or "").strip()
+    try:
+        raw = label.encode()[:24]
+    except Exception:
+        raw = b""
+    off = index * 24
+    for i in range(24):
+        _labels[off + i] = raw[i] if i < len(raw) else 0
+    _lights[base + 19] = len(raw)
+    full = str(obj.get("name") or label).strip()
+    try:
+        nb = full.encode()[:_NAME_MAX]
+    except Exception:
+        nb = b""
+    noff = index * _NAME_MAX
+    for i in range(_NAME_MAX):
+        _names[noff + i] = nb[i] if i < len(nb) else 0
+    _lights[base + 32] = len(nb)
+    bp = _pulses_from_spec(spec_b) if isinstance(spec_b, dict) else (0, 0, 0, 0, 0, 0)
+    for k in range(6):
+        _put_u16(base + 20 + k * 2, bp[k])
+
+
+def _take_light(items, raw):
+    global _nlights
+    if _nlights >= _LIGHT_MAX:
+        return
+    try:
+        obj = json.loads(raw)
+    except Exception:
+        return
+    if isinstance(obj, dict):
+        if _pack_fill:
+            _put_light(obj, _nlights)
+        _nlights += 1
+        if _nlights % 16 == 0:
+            gc.collect()
+
+
+def _pulses_from_spec(spec):
+    out = [0, 0, 0, 0, 0, 0]
+    if not isinstance(spec, dict):
+        return tuple(out)
+    on = spec.get("on_s") or [1.0]
+    off = spec.get("off_s") or [0.0]
+    for i in range(3):
+        try:
+            out[i * 2] = int(float(on[i] if i < len(on) else 0) * 1000)
+        except Exception:
+            out[i * 2] = 0
+        try:
+            out[i * 2 + 1] = int(float(off[i] if i < len(off) else 0) * 1000)
+        except Exception:
+            out[i * 2 + 1] = 0
+    return tuple(out)
+
+
+def _scan_light_file(path):
+    """Read one lighthouse object at a time so the whole list is never in RAM."""
+    try:
+        f = open(path, "r")
+    except Exception:
+        return False
+    items = []
+    try:
+        in_str = False
+        esc = False
+        arr = False
+        depth = 0
+        key = '"lighthouses"'
+        key_i = 0
+        wait_colon = False
+        wait_bracket = False
+        capturing = False
+        cap = []
+        cap_depth = 0
+        while True:
+            chunk = f.read(128)
+            if not chunk:
                 break
-        if not items:
+            if chunk.startswith("\ufeff"):
+                chunk = chunk[1:]
+            for c in chunk:
+                if capturing:
+                    cap.append(c)
+                    if in_str:
+                        if esc:
+                            esc = False
+                        elif c == "\\":
+                            esc = True
+                        elif c == '"':
+                            in_str = False
+                    else:
+                        if c == '"':
+                            in_str = True
+                            esc = False
+                        elif c == "{":
+                            cap_depth += 1
+                        elif c == "}":
+                            cap_depth -= 1
+                            if cap_depth == 0:
+                                raw = "".join(cap)
+                                cap = []
+                                capturing = False
+                                _take_light(items, raw)
+                                del raw
+                                if _nlights >= _LIGHT_MAX:
+                                    return _nlights
+                    continue
+                if in_str:
+                    if esc:
+                        esc = False
+                        key_i = 0
+                    elif c == "\\":
+                        esc = True
+                        key_i = 0
+                    elif c == '"':
+                        in_str = False
+                        if not arr and key_i == len(key) - 1:
+                            wait_colon = True
+                        key_i = 0
+                    elif key_i > 0 and key_i < len(key) - 1 and c == key[key_i]:
+                        key_i += 1
+                    else:
+                        key_i = 0
+                    continue
+                if c == '"':
+                    in_str = True
+                    esc = False
+                    key_i = 0 if arr else 1
+                    continue
+                if wait_colon:
+                    if c == ":":
+                        wait_colon = False
+                        wait_bracket = True
+                    elif c not in " \t\r\n":
+                        wait_colon = False
+                    continue
+                if wait_bracket:
+                    if c == "[":
+                        wait_bracket = False
+                        arr = True
+                        depth = 1
+                    elif c not in " \t\r\n":
+                        wait_bracket = False
+                    continue
+                if not arr:
+                    continue
+                if c == "[":
+                    depth += 1
+                elif c == "]":
+                    depth -= 1
+                    if depth <= 0:
+                        arr = False
+                elif c == "{" and depth == 1:
+                    capturing = True
+                    cap = ["{"]
+                    cap_depth = 1
+                    in_str = False
+                    esc = False
+                    key_i = 0
+        return True
+    finally:
+        f.close()
+
+
+def _compact_from_file(path):
+    """Count the lights, then fill one buffer of that exact size."""
+    global _nlights, _stations, _lights, _labels, _names, _pack_fill
+    _pack_fill = False
+    _nlights = 0
+    _stations = []
+    _names = bytearray(0)
+    if not _scan_light_file(path):
+        return 0
+    n = _nlights
+    if n < 1:
+        return 0
+    gc.collect()
+    _lights = bytearray(n * _REC)
+    _labels = bytearray(n * 24)
+    _names = bytearray(n * _NAME_MAX)
+    _pack_fill = True
+    _nlights = 0
+    _stations = []
+    _scan_light_file(path)
+    gc.collect()
+    return _nlights
+
+
+def _adopt_lights(n, save_count):
+    global NUM_LEDS
+    if n < 1:
+        n = 1
+    if n > _LIGHT_MAX:
+        n = _LIGHT_MAX
+    if n != NUM_LEDS:
+        NUM_LEDS = n
+        init_strip()
+        if save_count:
+            try:
+                cfg = load_config()
+                cfg["num_leds"] = NUM_LEDS
+                with open(CONFIG_FILE, "w") as cf:
+                    json.dump(cfg, cf)
+            except Exception as e:
+                print("num_leds save:", e)
+    elif strip is None:
+        init_strip()
+    gc.collect()
+
+
+def _install_light_file(tmp):
+    n = _compact_from_file(tmp)
+    if not n:
+        try:
+            os.remove(tmp)
+        except Exception:
+            pass
+        _compact_from_file(LIGHTHOUSE_FILE)
+        raise ValueError("empty list")
+    try:
+        os.remove(LIGHTHOUSE_FILE)
+    except Exception:
+        pass
+    os.rename(tmp, LIGHTHOUSE_FILE)
+    _adopt_lights(n, True)
+    print("Saved", _nlights, "lighthouses")
+    return _nlights
+
+
+def load_lighthouses():
+    global _nlights
+    try:
+        n = 0
+        for name in (LIGHTHOUSE_FILE, "lighthouses_defaults.json"):
+            n = _compact_from_file(name)
+            if n:
+                break
+        if not n:
             raise ValueError("empty list")
-        items.sort(key=lambda x: int(x.get("led", 0)))
-        lighthouses = items
-        print("Loaded", len(lighthouses), "lighthouses")
+        _adopt_lights(n, False)
+        print("Loaded", _nlights, "lighthouses")
     except Exception as e:
         print("lighthouses.json failed:", e)
         print("Re-copy pico/lighthouses.json to the board as UTF-8 text.")
-        lighthouses = []
+        _nlights = 0
+
+
+def _u16_at(i, off):
+    o = i * _REC + off
+    return _lights[o] | (_lights[o + 1] << 8)
+
+
+def _led_at(i):
+    return _u16_at(i, 0)
+
+
+def _skip_at(i):
+    return _lights[i * _REC + 2]
+
+
+def _color_at(i, off):
+    n = _lights[i * _REC + off]
+    if 0 < n < len(_COLOR_CH):
+        return _COLOR_CH[n]
+    return ""
+
+
+def _label_at(i):
+    ln = _lights[i * _REC + 19]
+    if not ln:
+        return ""
+    off = i * 24
+    try:
+        return bytes(_labels[off:off + ln]).decode()
+    except Exception:
+        return ""
+
+
+def _name_at(i):
+    """Full place name for the one-light scroll. Short label if it will not fit."""
+    if i is None or i < 0 or i >= _nlights or not _names:
+        return _label_at(i) if i is not None and 0 <= i < _nlights else ""
+    ln = _lights[i * _REC + 32]
+    off = i * _NAME_MAX
+    if ln and off + ln <= len(_names):
+        try:
+            text = bytes(_names[off:off + ln]).decode()
+            if text:
+                return text
+        except Exception:
+            pass
+    return _label_at(i)
+
+
+def _sta_at(i, off):
+    n = _lights[i * _REC + off]
+    if n <= 0 or n > len(_stations):
+        return ""
+    return _stations[n - 1]
+
+
+def _pms(i, base, k):
+    return _u16_at(i, base + k * 2)
+
+
+def _span_at(i, base):
+    total = 0
+    for k in range(6):
+        total += _pms(i, base, k)
+    if total < 200:
+        total = 200
+    return total
+
+
+def _on_at(i, base, now_ms):
+    on0 = _pms(i, base, 0)
+    off0 = _pms(i, base, 1)
+    if off0 <= 0 and _pms(i, base, 2) == 0 and _pms(i, base, 3) == 0 and _pms(i, base, 4) == 0 and _pms(i, base, 5) == 0:
+        return on0 > 0
+    total = 0
+    for k in range(6):
+        total += _pms(i, base, k)
+    if total <= 0:
+        total = 1000
+    t = now_ms % total
+    cursor = 0
+    for k in range(0, 6, 2):
+        on = _pms(i, base, k)
+        off = _pms(i, base, k + 1)
+        if on == 0 and off == 0:
+            break
+        if t < cursor + on:
+            return on > 0
+        cursor += on
+        if t < cursor + off:
+            return False
+        cursor += off
+    return False
 
 
 def init_strip():
@@ -876,12 +1288,11 @@ def paint_all(rgb):
 
 
 def startup_chase():
-    count = min(NUM_LEDS, max(1, len(lighthouses)))
+    count = min(NUM_LEDS, max(1, _nlights))
     for i in range(count):
         for j in range(NUM_LEDS):
             strip[j] = (0, 0, 0)
-        lh = lighthouses[i] if i < len(lighthouses) else None
-        color = light_color(lh) if lh else (255, 180, 60)
+        color = _rgb(_color_at(i, 3) or "W") if i < _nlights else (255, 180, 60)
         strip[i] = scale_color(color, 0.28)
         strip.write()
         time.sleep_ms(160)
@@ -900,9 +1311,9 @@ def _metar_id(sid):
 
 def unique_stations():
     ids = []
-    for lh in lighthouses:
-        sid = _metar_id(lh.get("metar", ""))
-        fb = _metar_id(lh.get("metar_fallback", "KSUE"))
+    for i in range(_nlights):
+        sid = _sta_at(i, 17)
+        fb = _sta_at(i, 18)
         if sid and sid not in ids:
             ids.append(sid)
         if fb and fb not in ids:
@@ -1065,6 +1476,8 @@ def _store_metar(found, station, raw, category=""):
     prev = found.get(station)
     if prev and not _metar_is_newer(raw, prev.get("raw") or ""):
         return
+    if len(raw) > 180:
+        raw = raw[:180]
     found[station] = {
         "category": category or _parse_flight_category(raw) or "VFR",
         "raw": raw,
@@ -1134,6 +1547,16 @@ def _ingest_xml(text, station, found):
         _store_metar(found, station, raw, category)
 
 
+def _keep_stations(found):
+    """A failed download must not wipe the reports already on the lights."""
+    if found:
+        status["stations"] = found
+        return len(found)
+    kept = len(status.get("stations") or {})
+    print("METAR kept", kept, "stations")
+    return kept
+
+
 def fetch_metars():
     global _matrix_need_text, _oled_msgs
     _release_wifi_manager()
@@ -1144,29 +1567,45 @@ def fetch_metars():
     for sid in ids:
         wanted[sid] = True
     found = {}
-    # No hours = current observation only (hours=1 returns every report in the last hour).
-    url = "https://aviationweather.gov/api/data/metar?ids=%s&format=raw" % ",".join(ids)
-    print("Fetch", url)
+    # A few stations per request. One URL for every light will not fit in RAM.
     bulk_err = ""
-    try:
-        _ingest_raw(_http_get_text(url), wanted, found)
-    except Exception as e:
-        bulk_err = str(e)
-        print("METAR bulk failed:", e)
-        if "ENOMEM" in bulk_err:
-            _release_wifi_manager()
-            time.sleep_ms(400)
-            try:
-                _ingest_raw(_http_get_text(url), wanted, found)
-                bulk_err = ""
-            except Exception as e2:
-                bulk_err = str(e2)
-                print("METAR bulk retry failed:", e2)
+    start = 0
+    while start < len(ids):
+        batch = ids[start:start + 6]
+        start += 6
+        wanted = {}
+        for sid in batch:
+            wanted[sid] = True
+        url = "https://aviationweather.gov/api/data/metar?ids=%s&format=raw" % ",".join(batch)
+        print("Fetch", url)
+        try:
+            text = _http_get_text(url)
+            _ingest_raw(text, wanted, found)
+            del text
+        except Exception as e:
+            if "ENOMEM" in str(e) or "errno 12" in str(e).lower():
+                gc.collect()
+                try:
+                    text = _http_get_text(url)
+                    _ingest_raw(text, wanted, found)
+                    del text
+                    e = None
+                except Exception as e2:
+                    e = e2
+            if e is not None:
+                bulk_err = str(e)
+                print("METAR bulk failed:", e)
+        gc.collect()
     missing = [sid for sid in ids if sid not in found]
-    if missing and not found and "ENOMEM" in bulk_err:
-        print("METAR skipped, low memory")
+    gave_up = bulk_err.lower()
+    network_down = (
+        "timeout" in gave_up or "connect" in gave_up or "tls" in gave_up or "no http" in gave_up
+    )
+    if missing and not found and ("ENOMEM" in bulk_err or network_down):
+        print("METAR skipped, network" if network_down else "METAR skipped, low memory")
         missing = []
     for sid in missing:
+        wanted = {sid: True}
         try:
             one = "https://aviationweather.gov/api/data/metar?ids=%s&format=raw" % sid
             print("Fetch", sid)
@@ -1182,14 +1621,18 @@ def fetch_metars():
                 print("Got", sid, "from XML")
         except Exception as e:
             print("METAR", sid, "xml failed:", e)
-    status["stations"] = found
+    _keep_stations(found)
     status["last_fetch"] = time.time()
     if not _ota_scroll_pending:
         _matrix_need_text = True
         _oled_msgs = []
     still = [sid for sid in ids if sid not in found]
-    print("Got", len(found), "stations", list(found.keys()))
+    print("Got", len(found), "stations")
+    shown = 0
     for sid in found:
+        if shown >= 8:
+            break
+        shown += 1
         raw = found[sid].get("raw", "")
         codes = wx_codes(raw)
         print(sid, raw[:72])
@@ -1198,15 +1641,12 @@ def fetch_metars():
         print("No METAR yet:", still)
 
 
-def station_for(lh):
+def station_for(i):
     stations = status.get("stations") or {}
-    primary = _metar_id(lh.get("metar", ""))
-    fallback = _metar_id(lh.get("metar_fallback", "KSUE"))
+    primary = _sta_at(i, 17)
+    fallback = _sta_at(i, 18)
     if primary in stations:
         return stations[primary]
-    raw = str(lh.get("metar", "")).strip().upper()
-    if raw in stations:
-        return stations[raw]
     if fallback in stations:
         return stations[fallback]
     return None
@@ -1296,101 +1736,64 @@ def sync_ntp():
         print("NTP failed:", e)
 
 
-def light_specs(lh):
-    out = []
-    for key in ("light", "light_b"):
-        spec = lh.get(key)
-        if isinstance(spec, dict):
-            out.append(spec)
-    extra = lh.get("lights")
-    if isinstance(extra, list) and not out:
-        out = [s for s in extra if isinstance(s, dict)]
-    return out
+def _period_ms(pulses):
+    total = 0
+    for i in range(0, 6, 2):
+        total += pulses[i] + pulses[i + 1]
+    return total if total > 0 else 1000
 
 
-def light_spec(lh):
-    specs = light_specs(lh)
-    return specs[0] if specs else {}
-
-
-def light_color(lh):
-    code = str(light_spec(lh).get("color", "W")).upper()
-    return LIGHT_RGB.get(code, LIGHT_RGB["W"])
-
-
-def spec_period_s(spec):
-    if not spec:
-        return 1.0
-    on_s = spec.get("on_s") or [1.0]
-    off_s = spec.get("off_s") or [0.0]
-    period_s = float(spec.get("period_s") or 0)
-    if period_s <= 0:
-        n = max(len(on_s), len(off_s))
-        for i in range(n):
-            period_s += float(on_s[i] if i < len(on_s) else 0)
-            period_s += float(off_s[i] if i < len(off_s) else 0)
-    if period_s <= 0:
-        period_s = 1.0
-    return period_s
-
-
-def spec_on(spec, now_ms):
-    """True when this aid would be lit, using on_s/off_s pairs that fill period_s."""
-    if not spec:
-        return True
-    on_s = spec.get("on_s") or [1.0]
-    off_s = spec.get("off_s") or [0.0]
-    period_s = spec_period_s(spec)
-    # Fixed light: no eclipse
-    if len(off_s) == 1 and float(off_s[0]) <= 0 and len(on_s) == 1:
-        return True
-    t = (now_ms % int(period_s * 1000)) / 1000.0
-    cursor = 0.0
-    n = max(len(on_s), len(off_s))
-    for i in range(n):
-        on = float(on_s[i] if i < len(on_s) else 0)
+def _pulses_on(pulses, now_ms):
+    if pulses[1] <= 0 and pulses[2] == 0 and pulses[3] == 0 and pulses[4] == 0 and pulses[5] == 0:
+        return pulses[0] > 0
+    period = _period_ms(pulses)
+    t = now_ms % period
+    cursor = 0
+    for i in range(0, 6, 2):
+        on = pulses[i]
+        off = pulses[i + 1]
+        if on == 0 and off == 0:
+            break
         if t < cursor + on:
             return on > 0
         cursor += on
-        off = float(off_s[i] if i < len(off_s) else 0)
         if t < cursor + off:
             return False
         cursor += off
     return False
 
 
-def characteristic_on(lh, now_ms):
-    return frame_color(lh, now_ms) is not None
+def _rgb(code):
+    return LIGHT_RGB.get(code or "W", LIGHT_RGB["W"])
 
 
-def frame_color(lh, now_ms):
-    specs = light_specs(lh)
-    if not specs:
+def light_color(i):
+    return _rgb(_color_at(i, 3) or "W")
+
+
+def characteristic_on(i, now_ms):
+    return frame_color(i, now_ms) is not None
+
+
+def frame_color(i, now_ms):
+    color = _color_at(i, 3)
+    color_b = _color_at(i, 16)
+    if not color and not color_b:
         return LIGHT_RGB["W"]
-    if len(specs) == 1:
-        spec = specs[0]
-        if spec_on(spec, now_ms):
-            code = str(spec.get("color", "W")).upper()
-            return LIGHT_RGB.get(code, LIGHT_RGB["W"])
+    if not color_b:
+        if _on_at(i, 4, now_ms):
+            return _rgb(color)
         return None
-    slices = []
-    for spec in specs:
-        ms = int(spec_period_s(spec) * 1000)
-        if ms < 200:
-            ms = 200
-        slices.append((spec, ms))
-    total = 0
-    for _spec, ms in slices:
-        total += ms
+    p1 = _span_at(i, 4)
+    p2 = _span_at(i, 20)
+    total = p1 + p2
     t = now_ms % total
-    acc = 0
-    for spec, ms in slices:
-        if t < acc + ms:
-            if spec_on(spec, t - acc):
-                code = str(spec.get("color", "W")).upper()
-                return LIGHT_RGB.get(code, LIGHT_RGB["W"])
-            return None
-        acc += ms
+    if t < p1:
+        if _on_at(i, 4, t):
+            return _rgb(color)
+        return None
+    if _on_at(i, 20, t - p1):
+        return _rgb(color_b)
     return None
 
 
@@ -1415,43 +1818,54 @@ def paint_identify(led_i):
         return
     for i in range(NUM_LEDS):
         strip[i] = (0, 0, 0)
+    found = None
     if 0 <= led_i < NUM_LEDS:
-        lh = None
-        for item in lighthouses:
-            if int(item.get("led", -1)) == led_i:
-                lh = item
+        for i in range(_nlights):
+            if _led_at(i) == led_i:
+                found = i
                 break
-        if lh:
-            color = frame_color(lh, time.ticks_ms()) or light_color(lh)
-        else:
-            color = (255, 180, 60)
-        strip[led_i] = scale_color(color)
+    if found is None:
+        color = (255, 180, 60)
+    else:
+        color = frame_color(found, time.ticks_ms()) or light_color(found)
+    strip[led_i] = scale_color(color)
     strip.write()
 
 
-def _tour_lights():
-    items = []
-    for lh in lighthouses:
-        if lh.get("skip"):
+def _tour_count():
+    n = 0
+    for i in range(_nlights):
+        if _skip_at(i):
             continue
-        try:
-            led_i = int(lh.get("led", -1))
-        except Exception:
-            continue
+        led_i = _led_at(i)
         if 0 <= led_i < NUM_LEDS:
-            items.append(lh)
-    return items
+            n += 1
+    return n
 
 
-def _tour_label(lh):
-    return str(lh.get("short_name") or lh.get("name") or "").strip()
+def _tour_at(index):
+    n = 0
+    for i in range(_nlights):
+        if _skip_at(i):
+            continue
+        led_i = _led_at(i)
+        if not (0 <= led_i < NUM_LEDS):
+            continue
+        if n == index:
+            return i
+        n += 1
+    return None
 
 
-def _light_wx_segments(lh):
-    name = _tour_label(lh)
+def _tour_label(i):
+    return _label_at(i) if i is not None else ""
+
+
+def _light_wx_segments(i, full=False):
+    name = _name_at(i) if full else _tour_label(i)
     if not name:
         return []
-    info = station_for(lh) or {}
+    info = station_for(i) or {}
     cat = str(info.get("category") or "").strip().upper()
     color = CATEGORY_COLOR.get(cat) or CATEGORY_COLOR[""]
     segs = [(name, color)]
@@ -1491,7 +1905,7 @@ def tour_tick():
         return
     if time.ticks_diff(_tour_until, now) > 0:
         return
-    items = _tour_lights()
+    items_n = _tour_count()
     if _tour_phase == "normal":
         _tour_phase = "dark"
         _tour_step = 0
@@ -1499,7 +1913,7 @@ def tour_tick():
         _matrix_ip_done = True
         _tour_refresh_screens()
     elif _tour_phase == "dark":
-        if not items:
+        if not items_n:
             _tour_phase = "normal"
             _tour_until = time.ticks_add(now, TOUR_NORMAL_MS)
         else:
@@ -1509,7 +1923,7 @@ def tour_tick():
             _tour_refresh_screens()
     else:
         _tour_step += 1
-        if _tour_step >= len(items):
+        if _tour_step >= _tour_count():
             _tour_phase = "normal"
             _tour_step = 0
             _tour_until = time.ticks_add(now, TOUR_NORMAL_MS)
@@ -1518,36 +1932,43 @@ def tour_tick():
         _tour_refresh_screens()
 
 
-def _revealed_leds():
-    if LIGHT_SHOW != "TOUR":
-        return None
-    if _tour_phase == "dark":
-        return set()
-    items = _tour_lights()
-    if _tour_phase == "populate":
-        step = _tour_step
-        if step < 0:
-            step = 0
-        return {int(lh.get("led")) for lh in items[: step + 1]}
-    return None
-
-
 def _tour_current():
     if _tour_phase != "populate":
-        return None
-    items = _tour_lights()
-    if not items:
         return None
     step = _tour_step
     if step < 0:
         step = 0
-    if step >= len(items):
-        step = len(items) - 1
-    return items[step]
+    return _tour_at(step)
+
+
+def _fill_show_mask(buf):
+    show_all = LIGHT_SHOW != "TOUR" or _tour_phase == "normal"
+    if show_all:
+        for i in range(NUM_LEDS):
+            buf[i] = 1
+        return
+    for i in range(NUM_LEDS):
+        buf[i] = 0
+    if _tour_phase == "dark":
+        return
+    n = 0
+    limit = _tour_step if _tour_step > 0 else 0
+    for i in range(_nlights):
+        if _skip_at(i):
+            continue
+        led = _led_at(i)
+        if not (0 <= led < NUM_LEDS):
+            continue
+        if n <= limit:
+            buf[led] = 1
+        n += 1
+
+
+_frame_buf = bytearray(0)
 
 
 def render_frame():
-    global _identify_led
+    global _identify_led, _frame_buf
     now_ms = time.ticks_ms()
     tour_tick()
     if _identify_led is not None:
@@ -1561,25 +1982,18 @@ def render_frame():
         paint_all((0, 0, 0))
         return
     _ldr_refresh()
-    revealed = _revealed_leds()
-    used = {}
-    for lh in lighthouses:
-        led_i = int(lh.get("led", 0))
-        if led_i < 0 or led_i >= NUM_LEDS:
+    if len(_frame_buf) != NUM_LEDS:
+        _frame_buf = bytearray(NUM_LEDS)
+    _fill_show_mask(_frame_buf)
+    for i in range(NUM_LEDS):
+        strip[i] = (0, 0, 0)
+    for i in range(_nlights):
+        led_i = _led_at(i)
+        if led_i < 0 or led_i >= NUM_LEDS or _skip_at(i) or not _frame_buf[led_i]:
             continue
-        if lh.get("skip") or (revealed is not None and led_i not in revealed):
-            strip[led_i] = (0, 0, 0)
-            used[led_i] = True
-            continue
-        color = frame_color(lh, now_ms)
+        color = frame_color(i, now_ms)
         if color:
             strip[led_i] = scale_color(color)
-        else:
-            strip[led_i] = (0, 0, 0)
-        used[led_i] = True
-    for i in range(NUM_LEDS):
-        if i not in used:
-            strip[i] = (0, 0, 0)
     strip.write()
 
 
@@ -1590,7 +2004,7 @@ def _listen_http(port):
     s = socket.socket()
     s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
     s.bind(("0.0.0.0", port))
-    s.listen(2)
+    s.listen(4)
     s.settimeout(0)
     return s
 
@@ -1685,18 +2099,58 @@ def apply_lighthouse_list(items):
     return len(cleaned)
 
 
-def read_http(conn):
-    conn.settimeout(2)
+def _recv_ready(conn, n, deadline):
+    """None means still waiting. Empty bytes means the browser closed."""
+    try:
+        conn.setblocking(False)
+    except Exception:
+        pass
+    while True:
+        if time.ticks_diff(deadline, time.ticks_ms()) <= 0:
+            return None
+        try:
+            chunk = conn.recv(n)
+        except OSError:
+            time.sleep_ms(5)
+            continue
+        if chunk is None:
+            time.sleep_ms(5)
+            continue
+        return chunk
+
+
+def _read_http_head(conn):
+    # A closed browser tab can leave a socket with no request. Do not wait
+    # on it, or the phone app’s short probe never gets an answer.
+    try:
+        conn.setblocking(False)
+    except Exception:
+        pass
     data = b""
-    while b"\r\n\r\n" not in data:
-        chunk = conn.recv(1024)
+    deadline = time.ticks_add(time.ticks_ms(), 800)
+    idle_deadline = time.ticks_add(time.ticks_ms(), 80)
+    while b"\r\n\r\n" not in data and len(data) <= 4096:
+        if time.ticks_diff(deadline, time.ticks_ms()) <= 0:
+            break
+        if not data and time.ticks_diff(idle_deadline, time.ticks_ms()) <= 0:
+            break
+        try:
+            chunk = conn.recv(256)
+        except OSError:
+            time.sleep_ms(5)
+            continue
+        if chunk is None:
+            time.sleep_ms(5)
+            continue
         if not chunk:
             break
         data += chunk
-        if len(data) > 16384:
-            break
+        idle_deadline = deadline
+    # No complete request: close. Do not answer it as the setup page.
+    # A phone browser leaves a spare connection open, and sending the page
+    # on that connection keeps the app from getting a reply.
     if b"\r\n\r\n" not in data:
-        return data.decode(), ""
+        return "", b"", 0
     header, body = data.split(b"\r\n\r\n", 1)
     clen = 0
     for line in header.split(b"\r\n"):
@@ -1705,15 +2159,71 @@ def read_http(conn):
                 clen = int(line.split(b":", 1)[1].strip())
             except Exception:
                 clen = 0
-    while len(body) < clen:
-        more = conn.recv(1024)
+    try:
+        return header.decode(), body, clen
+    except Exception:
+        return "", body, clen
+
+
+def _finish_body(conn, first, clen):
+    if clen > 8192:
+        left = clen - len(first)
+        deadline = time.ticks_add(time.ticks_ms(), 2000)
+        while left > 0:
+            n = 512 if left > 512 else left
+            chunk = _recv_ready(conn, n, deadline)
+            if not chunk:
+                break
+            left -= len(chunk)
+        return ""
+    buf = bytearray(first)
+    deadline = time.ticks_add(time.ticks_ms(), 2000)
+    while len(buf) < clen:
+        more = _recv_ready(conn, 512, deadline)
         if not more:
             break
-        body += more
+        buf.extend(more)
     try:
-        return header.decode(), body.decode()
+        return buf.decode()
     except Exception:
-        return "", ""
+        return ""
+
+
+def _stream_body(conn, first, clen, path):
+    if clen <= 0 or clen > 262144:
+        return False
+    try:
+        conn.setblocking(False)
+    except Exception:
+        pass
+    got = 0
+    f = open(path, "wb")
+    deadline = time.ticks_add(time.ticks_ms(), 8000)
+    try:
+        if first:
+            f.write(first)
+            got = len(first)
+        while got < clen:
+            if time.ticks_diff(deadline, time.ticks_ms()) < 0:
+                break
+            n = clen - got
+            if n > 512:
+                n = 512
+            try:
+                chunk = conn.recv(n)
+            except OSError:
+                time.sleep_ms(2)
+                continue
+            if not chunk:
+                time.sleep_ms(2)
+                continue
+            f.write(chunk)
+            got += len(chunk)
+            deadline = time.ticks_add(time.ticks_ms(), 8000)
+    finally:
+        f.close()
+    print("POST lights bytes", got, "of", clen)
+    return got >= clen
 
 
 _send_scratch = bytearray(128)
@@ -1728,7 +2238,7 @@ def _write_conn(conn, data):
         conn.setblocking(False)
     except Exception:
         pass
-    deadline = time.ticks_add(time.ticks_ms(), 8000)
+    deadline = time.ticks_add(time.ticks_ms(), 1000)
     while len(mv):
         if time.ticks_diff(deadline, time.ticks_ms()) < 0:
             return False
@@ -1743,11 +2253,23 @@ def _write_conn(conn, data):
             time.sleep_ms(2)
             continue
         mv = mv[sent:]
-        deadline = time.ticks_add(time.ticks_ms(), 8000)
+        deadline = time.ticks_add(time.ticks_ms(), 1000)
     return True
 
 
 def _close_conn(conn):
+    # Drop the socket instead of leaving it in a wait state. A phone browser
+    # opens several connections, and those leftovers fill the controller so
+    # the app cannot connect.
+    try:
+        import struct
+        conn.setsockopt(
+            socket.SOL_SOCKET,
+            socket.SO_LINGER,
+            struct.pack("ii", 1, 0),
+        )
+    except Exception:
+        pass
     try:
         conn.close()
     except Exception:
@@ -2138,29 +2660,64 @@ def _query_int(query, key, default=None):
 def handle_http():
     if _http_poll is None:
         return
-    try:
-        ready = _http_poll.poll(20)
-    except Exception as e:
-        print("HTTP poll", e)
-        return
-    for sock, _event in ready:
+    handled = 0
+    while handled < 4:
         try:
-            conn, _addr = sock.accept()
-        except OSError:
-            continue
-        _handle_conn(conn)
+            ready = _http_poll.poll(0 if handled else 5)
+        except Exception as e:
+            print("HTTP poll", e)
+            return
+        if not ready:
+            return
+        for sock, _event in ready:
+            try:
+                conn, _addr = sock.accept()
+            except OSError:
+                continue
+            handled += 1
+            _handle_conn(conn)
+            if handled >= 4:
+                return
 
 
 def _handle_conn(conn):
-    global _matrix_need_text, _resp_started
+    global _matrix_need_text, _resp_started, NUM_LEDS
     _resp_started = False
     try:
-        header, req_body = read_http(conn)
+        header, first_body, clen = _read_http_head(conn)
+        if not header:
+            _close_conn(conn)
+            return
         line = header.split("\r\n", 1)[0] if header else ""
         path = _request_path(line)
         query = _request_query(line)
         method = line.split(" ", 1)[0] if line else "GET"
-        if method == "OPTIONS":
+        req_body = ""
+        if method == "POST" and path == "/lighthouses":
+            try:
+                if not _stream_body(conn, first_body, clen, "lighthouses_tmp.json"):
+                    raise ValueError("short list")
+                count = _install_light_file("lighthouses_tmp.json")
+                _matrix_need_text = True
+                _http_send(conn, "application/json", json.dumps({
+                    "ok": True,
+                    "count": count,
+                    "num_leds": NUM_LEDS,
+                    "message": "saved",
+                }))
+            except Exception as e:
+                print("POST /lighthouses:", e)
+                try:
+                    os.remove("lighthouses_tmp.json")
+                except Exception:
+                    pass
+                _http_send(conn, "application/json", json.dumps({"ok": False, "message": str(e)}))
+        else:
+            if method == "POST" or first_body or clen:
+                req_body = _finish_body(conn, first_body, clen)
+        if method == "POST" and path == "/lighthouses":
+            pass
+        elif method == "OPTIONS":
             _http_send(conn, "text/plain", "", "204 No Content")
         elif method == "GET" and path == "/help":
             _send_file(conn, "help.html", "text/html; charset=utf-8", "<p>Copy help.html to the chart, then reload.</p>")
@@ -2191,33 +2748,18 @@ def _handle_conn(conn):
                 ms = start_identify(int(led), hold)
                 _http_send(conn, "application/json", json.dumps({"ok": True, "identifying": True, "led": int(led), "ms": ms}))
         elif method == "GET" and path == "/lighthouses":
-            # The built JSON is about 7 KB and a second copy of it fails on this chip.
+            # The file is the app's list. Stream it; do not build a second copy in RAM.
             _send_file(conn, "lighthouses.json", "application/json", "{\"ok\":false,\"lighthouses\":[]}")
-        elif method == "POST" and path == "/lighthouses":
-            try:
-                if req_body and req_body.lstrip()[:1] == "{":
-                    payload = json.loads(req_body)
-                else:
-                    payload = _parse_form(req_body)
-                items = payload.get("lighthouses") if isinstance(payload, dict) else payload
-                if isinstance(items, str):
-                    items = json.loads(items)
-                count = apply_lighthouse_list(items)
-                if req_body and req_body.lstrip()[:1] == "{":
-                    _http_send(conn, "application/json", json.dumps({"ok": True, "count": count, "num_leds": NUM_LEDS, "message": "saved"}))
-                else:
-                    _send_setup_page(conn)
-            except Exception as e:
-                _http_send(conn, "application/json", json.dumps({"ok": False, "message": str(e)}))
         elif method == "GET" and path == "/status":
             _http_send(conn, "application/json", json.dumps({
                 "ok": True,
                 "name": "GreatLakesLighthouses",
+                "board": "xiao-esp32c3",
                 "version": FIRMWARE_VERSION,
                 "ip": status.get("ip"),
                 "last_fetch": status.get("last_fetch"),
                 "stations": list((status.get("stations") or {}).keys()),
-                "lights": len(lighthouses),
+                "lights": _nlights,
                 "num_leds": NUM_LEDS,
                 "update_available": update_available,
                 "update_version": (update_info or {}).get("version", "") if update_available else "",
@@ -2242,10 +2784,14 @@ def _handle_conn(conn):
                 if not isinstance(payload, dict):
                     raise ValueError("object required")
                 old_pin = LED_PIN
+                old_leds = NUM_LEDS
+                keep_leds = "num_leds" not in payload or str(payload.get("num_leds")) == ""
                 _apply_config_fields(payload)
                 load_config()
+                if keep_leds:
+                    NUM_LEDS = old_leds
                 _matrix_need_text = True
-                if LED_PIN != old_pin:
+                if LED_PIN != old_pin or NUM_LEDS != old_leds:
                     init_strip()
                 reboot = (not is_json) or str(payload.get("reboot", "")).lower() in ("1", "true", "yes")
                 if is_json:
@@ -2297,6 +2843,8 @@ _oled_pass = 0
 _oled_hold_key = ""
 _matrix_need_text = True
 _matrix_hold_key = ""
+_matrix_live_key = ""
+_matrix_live_ip = False
 _matrix_ip_done = False
 _matrix_idle_until = 0
 _matrix_idle_pass = False
@@ -2318,10 +2866,10 @@ def _matrix_light_segments():
     segs = []
     weather_only = MATRIX_SCROLL == "WEATHER"
     first = True
-    for lh in lighthouses:
-        if lh.get("skip"):
+    for i in range(_nlights):
+        if _skip_at(i):
             continue
-        parts = _light_wx_segments(lh)
+        parts = _light_wx_segments(i)
         if not parts:
             continue
         if weather_only and len(parts) < 2:
@@ -2337,18 +2885,47 @@ def _seg_key(segs):
     return "|".join("%s%s" % (t, c) for t, c in segs)
 
 
+def _matrix_scroll_done(now):
+    global _matrix_need_text, _matrix_hold_key, _matrix_ip_done, _matrix_idle_until, _ota_banner_done, _ota_scroll_pending, _matrix_live_ip
+    import led_matrix
+    _matrix_hold_key = _matrix_live_key
+    _matrix_need_text = True
+    if _ota_scroll_pending:
+        _ota_scroll_pending = False
+        _ota_banner_done = True
+    if _matrix_live_ip:
+        _matrix_ip_done = True
+        _matrix_live_ip = False
+    if _matrix_idle_pass:
+        _matrix_idle_until = time.ticks_add(now, MATRIX_IDLE_MS)
+        led_matrix.set_segments([])
+
+
 def refresh_matrix():
-    global _matrix_need_text, _matrix_hold_key, _matrix_ip_done, _matrix_idle_until, _matrix_idle_pass, _ota_banner_done, _ota_scroll_pending
+    global _matrix_need_text, _matrix_hold_key, _matrix_ip_done, _matrix_idle_until, _matrix_idle_pass, _ota_banner_done, _ota_scroll_pending, _matrix_live_key, _matrix_live_ip
     try:
         import led_matrix
     except ImportError:
         return
     if not led_matrix.active():
         return
-    led_matrix.set_scroll_ms(197 - 17 * MATRIX_SCROLL_SPEED)
+    spd = MATRIX_SCROLL_SPEED
+    if spd < 1:
+        spd = 1
+    elif spd > 10:
+        spd = 10
+    pace = _MATRIX_PACE[spd - 1]
+    led_matrix.set_scroll_ms(pace[0], pace[1], pace[2])
     led_matrix.set_scroll_times(SCROLL_TIMES)
     if in_sleep_window():
         led_matrix.tick(0, True)
+        return
+    pwm = _pwm_from_slider(_ldr_level())
+    # A scroll already on screen only needs the next columns. Rebuilding the
+    # weather line every frame was slower than the draw.
+    if not _matrix_need_text and not _matrix_hold_key:
+        if led_matrix.tick(pwm, False):
+            _matrix_scroll_done(time.ticks_ms())
         return
     now = time.ticks_ms()
     segs = []
@@ -2356,7 +2933,7 @@ def refresh_matrix():
     if _ota_scroll_pending:
         segs.append((_ota_scroll_text(), (255, 140, 0)))
     elif current is not None:
-        segs.extend(_light_wx_segments(current))
+        segs.extend(_light_wx_segments(current, True))
     elif _tour_phase == "dark":
         pass
     elif not _matrix_ip_done:
@@ -2392,19 +2969,11 @@ def refresh_matrix():
         led_matrix.set_segments(segs)
         _matrix_need_text = False
         _matrix_idle_pass = idle
-    pwm = _pwm_from_slider(_ldr_level())
-    if led_matrix.tick(pwm, False):
-        _matrix_hold_key = key
-        _matrix_need_text = True
-        if _ota_scroll_pending:
-            _ota_scroll_pending = False
-            _ota_banner_done = True
+        _matrix_live_key = key
         ip = status.get("ip")
-        if ip and len(segs) == 1 and segs[0][0] == str(ip):
-            _matrix_ip_done = True
-        if _matrix_idle_pass:
-            _matrix_idle_until = time.ticks_add(now, MATRIX_IDLE_MS)
-            led_matrix.set_segments([])
+        _matrix_live_ip = bool(ip and len(segs) == 1 and segs[0][0] == str(ip))
+    if led_matrix.tick(pwm, False):
+        _matrix_scroll_done(now)
 
 
 def init_oled():
@@ -2567,7 +3136,7 @@ def _oled_draw_title(title):
 def _oled_messages():
     current = _tour_current()
     if current is not None:
-        parts = [text for text, _color in _light_wx_segments(current)]
+        parts = [text for text, _color in _light_wx_segments(current, True)]
         if parts:
             return [("Lighthouses", "  ".join(parts))]
     if _tour_phase == "dark":

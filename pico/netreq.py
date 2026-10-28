@@ -2,6 +2,7 @@
 # IPv4 first (home and hotel stay the same), then IPv6 DNS, then NAT64.
 
 import gc
+import select
 import socket
 import struct
 import utime as time
@@ -90,6 +91,80 @@ def _usable_addr(ai):
     return None
 
 
+def _err_no(exc):
+    args = getattr(exc, "args", None)
+    if args:
+        try:
+            return int(args[0])
+        except Exception:
+            pass
+    return None
+
+
+def _in_progress(err):
+    # Non-blocking connect reports "still working" under either errno set.
+    return err in (11, 114, 115, 119, 120)
+
+
+def _already_connected(err):
+    return err in (56, 106, 127)
+
+
+def _sock_error(sock):
+    try:
+        err = sock.getsockopt(socket.SOL_SOCKET, socket.SO_ERROR)
+    except Exception:
+        return 0
+    try:
+        return int(err) or 0
+    except Exception:
+        return 0
+
+
+def _connect_deadline(sock, addr, timeout):
+    """Give up on our own clock. This chip ignores settimeout during connect."""
+    try:
+        limit = int(timeout)
+    except Exception:
+        limit = 8
+    if limit < 1:
+        limit = 1
+    if limit > 4:
+        limit = 4
+    sock.setblocking(False)
+    try:
+        sock.connect(addr)
+    except OSError as e:
+        err = _err_no(e)
+        if _already_connected(err):
+            sock.settimeout(limit)
+            return
+        if not _in_progress(err):
+            raise
+    else:
+        sock.settimeout(limit)
+        return
+    poll = select.poll()
+    poll.register(sock, select.POLLOUT)
+    deadline = time.ticks_add(time.ticks_ms(), limit * 1000)
+    ready = None
+    while True:
+        left = time.ticks_diff(deadline, time.ticks_ms())
+        if left <= 0:
+            ready = None
+            break
+        wait = left if left < 200 else 200
+        ready = poll.poll(wait)
+        if ready:
+            break
+    if not ready:
+        raise OSError("connect timeout")
+    err = _sock_error(sock)
+    if err and not _already_connected(err):
+        raise OSError(err)
+    sock.settimeout(limit)
+
+
 def _connect_family(host, port, family, timeout):
     last = OSError("no address")
     infos = socket.getaddrinfo(host, port, family, socket.SOCK_STREAM)
@@ -106,8 +181,7 @@ def _connect_family(host, port, family, timeout):
             last = OSError("socket %s" % e)
             continue
         try:
-            sock.settimeout(timeout)
-            sock.connect(addr)
+            _connect_deadline(sock, addr, timeout)
             return sock
         except Exception as e:
             last = OSError("connect %s %s" % (addr[0], e))
@@ -150,13 +224,40 @@ def _paths():
     return order
 
 
+def _io_deadline(timeout):
+    try:
+        limit = int(timeout)
+    except Exception:
+        limit = 12
+    if limit < 1:
+        limit = 1
+    if limit > 60:
+        limit = 60
+    return time.ticks_add(time.ticks_ms(), limit * 1000)
+
+
+def _wait_ready(poll, deadline):
+    left = time.ticks_diff(deadline, time.ticks_ms())
+    if left <= 0:
+        raise OSError("tls timeout")
+    if left > 200:
+        left = 200
+    poll.poll(left)
+
+
 def _wrap_tls(sock, server_hostname):
+    # do_handshake=True retries forever on this chip. Finish it from _sendall.
+    try:
+        sock.setblocking(False)
+    except Exception:
+        pass
     if ssl is not None:
         try:
             return ssl.wrap_socket(
                 sock,
                 server_hostname=server_hostname,
                 cert_reqs=ssl.CERT_NONE,
+                do_handshake=False,
             )
         except TypeError:
             return ssl.wrap_socket(sock, server_hostname=server_hostname)
@@ -167,34 +268,62 @@ def _wrap_tls(sock, server_hostname):
         ctx.verify_mode = tls.CERT_NONE
     except Exception:
         pass
-    return ctx.wrap_socket(sock, server_hostname=server_hostname)
+    try:
+        return ctx.wrap_socket(
+            sock,
+            server_hostname=server_hostname,
+            do_handshake_on_connect=False,
+        )
+    except TypeError:
+        return ctx.wrap_socket(sock, server_hostname=server_hostname)
 
 
-def _sendall(sock, data):
+def _sendall(sock, data, deadline):
     if isinstance(data, str):
         data = data.encode()
     mv = memoryview(data)
     off = 0
+    poll = select.poll()
+    poll.register(sock, select.POLLIN | select.POLLOUT)
     while off < len(mv):
-        n = sock.write(mv[off:]) if hasattr(sock, "write") else sock.send(mv[off:])
-        if n is None:
-            n = len(mv) - off
-        if n <= 0:
-            raise OSError("send")
+        try:
+            n = sock.write(mv[off:]) if hasattr(sock, "write") else sock.send(mv[off:])
+        except OSError as e:
+            if _in_progress(_err_no(e)):
+                _wait_ready(poll, deadline)
+                continue
+            raise
+        if not n or n < 0:
+            _wait_ready(poll, deadline)
+            continue
         off += n
 
 
-def _recv(sock, n=512):
-    if hasattr(sock, "read"):
-        data = sock.read(n)
+def _recv(sock, n, deadline):
+    poll = select.poll()
+    poll.register(sock, select.POLLIN | select.POLLOUT)
+    while True:
+        try:
+            if hasattr(sock, "read"):
+                data = sock.read(n)
+            else:
+                data = sock.recv(n)
+        except OSError as e:
+            if _in_progress(_err_no(e)):
+                _wait_ready(poll, deadline)
+                continue
+            raise
+        # None means the handshake or the reply is not here yet. Empty is the end.
+        if data is None:
+            _wait_ready(poll, deadline)
+            continue
         return data or b""
-    return sock.recv(n) or b""
 
 
-def _read_http(sock, dest=None, max_size=49152):
+def _read_http(sock, deadline, dest=None, max_size=49152):
     buf = b""
     while b"\r\n\r\n" not in buf:
-        chunk = _recv(sock, 256)
+        chunk = _recv(sock, 256, deadline)
         if not chunk:
             break
         buf += chunk
@@ -218,7 +347,7 @@ def _read_http(sock, dest=None, max_size=49152):
         dest.write(body)
         total = len(body)
         while True:
-            chunk = _recv(sock, 512)
+            chunk = _recv(sock, 512, deadline)
             if not chunk:
                 break
             dest.write(chunk)
@@ -227,7 +356,7 @@ def _read_http(sock, dest=None, max_size=49152):
     chunks = [body]
     total = len(body)
     while total < max_size:
-        chunk = _recv(sock, 512)
+        chunk = _recv(sock, 512, deadline)
         if not chunk:
             break
         chunks.append(chunk)
@@ -262,10 +391,15 @@ def _request(url, timeout, dest=None):
                 wrapped = _wrap_tls(sock, host)
                 sock = None
             else:
+                try:
+                    sock.setblocking(False)
+                except Exception:
+                    pass
                 wrapped = sock
                 sock = None
-            _sendall(wrapped, req)
-            result = _read_http(wrapped, dest)
+            deadline = _io_deadline(timeout)
+            _sendall(wrapped, req, deadline)
+            result = _read_http(wrapped, deadline, dest)
             _set_preferred(how)
             print("HTTP", how, host)
             return result
